@@ -24,10 +24,10 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const analytics = getOwnerAnalytics(user.id);
-    const resources = getDbResourcesByOwner(user.id);
-    const bookings = getBookingsByOwner(user.id);
-    const trustProfile = getUserTrustProfile(user.id);
+    const analytics = await getOwnerAnalytics(user.id);
+    const resources = await getDbResourcesByOwner(user.id);
+    const bookings = await getBookingsByOwner(user.id);
+    const trustProfile = await getUserTrustProfile(user.id);
 
     return NextResponse.json({
       success: true,

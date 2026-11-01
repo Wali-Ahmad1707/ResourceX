@@ -16,7 +16,7 @@ export async function GET(req: NextRequest) {
     const status = searchParams.get("status") || undefined;
     const targetType = searchParams.get("targetType") || undefined;
 
-    const reports = getReportsForAdmin({ status, targetType });
+    const reports = await getReportsForAdmin({ status, targetType });
     return NextResponse.json({ success: true, reports });
   } catch (error: any) {
     console.error("[API_ADMIN_REPORTS_ERROR]", error);

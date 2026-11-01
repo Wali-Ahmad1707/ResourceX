@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const result = createReport({
+    const result = await createReport({
       reporterId: user.id,
       targetType: targetType as ReportTargetType,
       targetId,

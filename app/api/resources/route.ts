@@ -38,7 +38,7 @@ export async function GET(request: Request) {
     const ownerId = searchParams.get("ownerId") || undefined;
     const status = searchParams.get("status") || "active";
 
-    const resources = getAllDbResources({
+    const resources = await getAllDbResources({
       category,
       condition,
       availabilityStatus,
@@ -96,7 +96,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const created = createResource({
+    const created = await createResource({
       ownerId: user.id,
       ...result.data,
     });

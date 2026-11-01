@@ -20,7 +20,7 @@ export async function PATCH(
     const body = await req.json();
     const { name, description, icon, isActive, displayOrder } = body;
 
-    const result = updatePlatformCategory(admin.id, id, {
+    const result = await updatePlatformCategory(admin.id, id, {
       name,
       description,
       icon,
@@ -61,7 +61,7 @@ export async function DELETE(
   const { id } = await params;
 
   try {
-    const result = deletePlatformCategory(admin.id, id);
+    const result = await deletePlatformCategory(admin.id, id);
     if (!result.success) {
       return NextResponse.json({ error: result.error }, { status: 400 });
     }

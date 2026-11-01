@@ -16,7 +16,7 @@ export async function GET(req: NextRequest) {
     const status = searchParams.get("status") || undefined;
     const search = searchParams.get("search") || undefined;
 
-    const bookings = getAllBookingsForAdmin({ status, search });
+    const bookings = await getAllBookingsForAdmin({ status, search });
     return NextResponse.json({ success: true, bookings });
   } catch (error: any) {
     console.error("[API_ADMIN_BOOKINGS_ERROR]", error);

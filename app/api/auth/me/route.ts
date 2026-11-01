@@ -13,8 +13,8 @@ export async function GET() {
       );
     }
 
-    const auditLogs = getUserAuditLogs(user.id, 5);
-    const stats = getUserStats(user.id, user.role);
+    const auditLogs = await getUserAuditLogs(user.id, 5);
+    const stats = await getUserStats(user.id, user.role);
 
     return NextResponse.json({
       success: true,

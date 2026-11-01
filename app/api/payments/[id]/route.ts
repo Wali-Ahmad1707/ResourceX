@@ -16,7 +16,7 @@ export async function GET(
     }
 
     const { id } = await params;
-    const payment = getPaymentById(id);
+    const payment = await getPaymentById(id);
     if (!payment) {
       return NextResponse.json(
         { error: "Payment not found." },
@@ -35,7 +35,7 @@ export async function GET(
       );
     }
 
-    const refunds = getRefundsByPaymentId(payment.id);
+    const refunds = await getRefundsByPaymentId(payment.id);
 
     return NextResponse.json({
       success: true,

@@ -19,7 +19,7 @@ export async function GET(request: Request, { params }: RouteParams) {
     }
 
     // Retrieve all approved bookings from SQLite
-    const approved = getResourceApprovedBookings(id);
+    const approved = await getResourceApprovedBookings(id);
     const bookedRanges = approved.map((b) => ({
       startDate: b.startDate,
       endDate: b.endDate,
@@ -27,7 +27,7 @@ export async function GET(request: Request, { params }: RouteParams) {
     }));
 
     // Waitlist queue count
-    const waitlist = getWaitlistByResource(id);
+    const waitlist = await getWaitlistByResource(id);
 
     return NextResponse.json({
       success: true,

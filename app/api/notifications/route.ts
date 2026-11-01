@@ -16,7 +16,7 @@ export async function GET() {
       );
     }
 
-    const notifications = getUserNotifications(user.id, 30);
+    const notifications = await getUserNotifications(user.id, 30);
     const unreadCount = notifications.filter((n) => n.isRead === 0).length;
 
     return NextResponse.json({
@@ -47,7 +47,7 @@ export async function PATCH(request: Request) {
     const { notificationId, all } = body;
 
     if (all) {
-      markAllNotificationsAsRead(user.id);
+      await markAllNotificationsAsRead(user.id);
       return NextResponse.json({
         success: true,
         message: "All notifications marked as read.",
@@ -55,7 +55,7 @@ export async function PATCH(request: Request) {
     }
 
     if (notificationId) {
-      markNotificationAsRead(notificationId, user.id);
+      await markNotificationAsRead(notificationId, user.id);
       return NextResponse.json({
         success: true,
         message: "Notification marked as read.",

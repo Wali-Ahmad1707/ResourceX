@@ -40,7 +40,7 @@ export async function PATCH(request: Request) {
 
     const { fullName, phone, avatar, currentPassword, newPassword } = result.data;
 
-    const dbUser = findUserById(sessionUser.id);
+    const dbUser = await findUserById(sessionUser.id);
     if (!dbUser) {
       return NextResponse.json(
         { success: false, error: "User record not found" },
@@ -79,7 +79,7 @@ export async function PATCH(request: Request) {
       updates.passwordHash = hashPassword(newPassword);
     }
 
-    const updatedUser = updateUser(sessionUser.id, updates);
+    const updatedUser = await updateUser(sessionUser.id, updates);
     if (!updatedUser) {
       return NextResponse.json(
         { success: false, error: "Failed to update profile record" },

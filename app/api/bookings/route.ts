@@ -50,7 +50,7 @@ export async function POST(request: Request) {
     const { resourceId, startDate, endDate, purpose, message, pickupPreference } = result.data;
 
     // Check resource existence in DB or mock catalog
-    const dbResource = getDbResourceById(resourceId);
+    const dbResource = await getDbResourceById(resourceId);
     const mockResource = getResourceById(resourceId);
 
     if (!dbResource && !mockResource) {
@@ -66,15 +66,15 @@ export async function POST(request: Request) {
     const deposit = dbResource?.deposit || mockResource?.deposit || "None";
 
     // Determine Owner ID
-    const db = getDatabase();
+    const db = await getDatabase();
     let ownerId = "usr_demo_owner_01"; // Default to Marcus Vance
 
     if (dbResource) {
       ownerId = dbResource.ownerId;
     } else if (mockResource) {
-      const matchingOwner = db.prepare(
+      const matchingOwner = (await db.prepare(
         "SELECT id FROM users WHERE fullName = ? AND role = 'owner'"
-      ).get(mockResource.owner.name) as { id: string } | undefined;
+      ).get(mockResource.owner.name)) as { id: string } | null;
       if (matchingOwner && matchingOwner.id) {
         ownerId = matchingOwner.id;
       }
@@ -87,7 +87,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const creationResult = createBooking({
+    const creationResult = await createBooking({
       resourceId,
       borrowerId: user.id,
       ownerId,
@@ -144,9 +144,9 @@ export async function GET(request: Request) {
 
     let bookings = [];
     if (user.role === "owner") {
-      bookings = getBookingsByOwner(user.id, status || undefined);
+      bookings = await getBookingsByOwner(user.id, status || undefined);
     } else {
-      bookings = getBookingsByBorrower(user.id, status || undefined);
+      bookings = await getBookingsByBorrower(user.id, status || undefined);
     }
 
     // Enrich with resource metadata

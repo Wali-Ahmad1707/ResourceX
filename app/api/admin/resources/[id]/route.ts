@@ -15,7 +15,7 @@ export async function GET(
   }
 
   const { id } = await params;
-  const resource = getDbResourceById(id);
+  const resource = await getDbResourceById(id);
   if (!resource) {
     return NextResponse.json(
       { error: "Resource not found." },
@@ -58,7 +58,7 @@ export async function PATCH(
       );
     }
 
-    const result = moderateResourceByAdmin(admin.id, id, action, reason);
+    const result = await moderateResourceByAdmin(admin.id, id, action, reason);
     if (!result.success) {
       return NextResponse.json({ error: result.error }, { status: 400 });
     }

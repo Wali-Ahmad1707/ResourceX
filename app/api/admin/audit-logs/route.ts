@@ -19,7 +19,7 @@ export async function GET(req: NextRequest) {
     const limit = searchParams.get("limit") ? parseInt(searchParams.get("limit")!) : 50;
     const offset = searchParams.get("offset") ? parseInt(searchParams.get("offset")!) : 0;
 
-    const result = getAllAuditLogsForAdmin({
+    const result = await getAllAuditLogsForAdmin({
       actorId,
       entityType,
       action,

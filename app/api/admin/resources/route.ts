@@ -17,7 +17,7 @@ export async function GET(req: NextRequest) {
     const category = searchParams.get("category") || undefined;
     const search = searchParams.get("search") || undefined;
 
-    const resources = getAllResourcesForAdmin({ moderationStatus, category, search });
+    const resources = await getAllResourcesForAdmin({ moderationStatus, category, search });
     return NextResponse.json({ success: true, resources });
   } catch (error: any) {
     console.error("[API_ADMIN_RESOURCES_ERROR]", error);

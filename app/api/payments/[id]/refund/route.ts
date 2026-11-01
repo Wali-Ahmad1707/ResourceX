@@ -17,7 +17,7 @@ export async function POST(
     }
 
     const { id } = await params;
-    const payment = getPaymentById(id);
+    const payment = await getPaymentById(id);
     if (!payment) {
       return NextResponse.json(
         { error: "Payment not found." },
@@ -76,7 +76,7 @@ export async function POST(
       }
     }
 
-    const res = createRefund({
+    const res = await createRefund({
       paymentId: payment.id,
       amount,
       reason: reason.trim(),

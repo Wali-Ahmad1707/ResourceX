@@ -12,7 +12,7 @@ export async function GET() {
   }
 
   try {
-    const reports = getReportsForUser(user.id);
+    const reports = await getReportsForUser(user.id);
     return NextResponse.json({ success: true, reports });
   } catch (error: any) {
     console.error("[API_MY_REPORTS_ERROR]", error);

@@ -12,7 +12,7 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const payments = getPaymentsForOwner(user.id);
+    const payments = await getPaymentsForOwner(user.id);
     return NextResponse.json({
       success: true,
       payments,

@@ -58,7 +58,7 @@ export async function POST(request: Request) {
     const { fullName, email, phone, password, role } = result.data;
 
     // 1. Check for duplicate email
-    const existingUser = findUserByEmail(email);
+    const existingUser = await findUserByEmail(email);
     if (existingUser) {
       return NextResponse.json(
         { success: false, error: "An account with this email address already exists" },
@@ -71,7 +71,7 @@ export async function POST(request: Request) {
 
     // 3. Create persistent user in SQLite
     const userId = `usr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const user = createUser({
+    const user = await createUser({
       id: userId,
       fullName,
       email,

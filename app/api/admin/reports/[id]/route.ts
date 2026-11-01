@@ -15,7 +15,7 @@ export async function GET(
   }
 
   const { id } = await params;
-  const report = getReportById(id);
+  const report = await getReportById(id);
   if (!report) {
     return NextResponse.json(
       { error: "Report not found." },
@@ -44,7 +44,7 @@ export async function PATCH(
     const body = await req.json();
     const { status, assignedAdminId, adminNotes, resolution, actionTaken } = body;
 
-    const result = updateReportByAdmin(admin.id, id, {
+    const result = await updateReportByAdmin(admin.id, id, {
       status,
       assignedAdminId,
       adminNotes,

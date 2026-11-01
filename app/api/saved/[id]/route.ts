@@ -17,7 +17,7 @@ export async function DELETE(request: Request, { params }: RouteParams) {
     }
 
     const { id } = await params;
-    unsaveResource(user.id, id);
+    await unsaveResource(user.id, id);
 
     return NextResponse.json({
       success: true,

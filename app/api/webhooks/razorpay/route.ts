@@ -46,7 +46,7 @@ export async function POST(req: NextRequest) {
     const eventId = payload.event_id || payload.id || req.headers.get("x-razorpay-event-id") || `evt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
 
     // Record webhook event for idempotency
-    const record = recordWebhookEvent({
+    const record = await recordWebhookEvent({
       eventId,
       eventType,
       payload: rawBody,
@@ -64,7 +64,7 @@ export async function POST(req: NextRequest) {
       case "payment.captured": {
         const paymentEntity = payload.payload?.payment?.entity;
         if (paymentEntity?.order_id && paymentEntity?.id) {
-          capturePayment({
+          await capturePayment({
             razorpayOrderId: paymentEntity.order_id,
             razorpayPaymentId: paymentEntity.id,
           });
@@ -75,7 +75,7 @@ export async function POST(req: NextRequest) {
       case "payment.failed": {
         const paymentEntity = payload.payload?.payment?.entity;
         if (paymentEntity?.order_id) {
-          markPaymentFailed({
+          await markPaymentFailed({
             razorpayOrderId: paymentEntity.order_id,
             failureReason: paymentEntity.error_description || "Payment failed via webhook notification.",
           });
@@ -93,7 +93,7 @@ export async function POST(req: NextRequest) {
         break;
     }
 
-    updateWebhookEventStatus(eventId, "processed");
+    await updateWebhookEventStatus(eventId, "processed");
 
     return NextResponse.json(
       { status: "success", received: true, eventId },

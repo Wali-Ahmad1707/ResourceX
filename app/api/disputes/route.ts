@@ -36,7 +36,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const result = createDispute({
+    const result = await createDispute({
       bookingId,
       initiatorId: user.id,
       reason,

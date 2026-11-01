@@ -12,7 +12,7 @@ export async function GET() {
   }
 
   try {
-    const disputes = getDisputesForUser(user.id);
+    const disputes = await getDisputesForUser(user.id);
     return NextResponse.json({ success: true, disputes });
   } catch (error: any) {
     console.error("[API_MY_DISPUTES_ERROR]", error);

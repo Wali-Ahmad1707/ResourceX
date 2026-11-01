@@ -24,7 +24,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Verify payment record exists
-    const existingPayment = getPaymentByOrderId(orderId);
+    const existingPayment = await getPaymentByOrderId(orderId);
     if (!existingPayment) {
       return NextResponse.json(
         { error: "Payment record not found for this order." },
@@ -48,7 +48,7 @@ export async function POST(req: NextRequest) {
     });
 
     if (!isValid) {
-      markPaymentFailed({
+      await markPaymentFailed({
         razorpayOrderId: orderId,
         failureReason: "Invalid HMAC SHA-256 payment signature verification.",
       });
@@ -60,7 +60,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Capture payment and update booking depositStatus
-    const captureRes = capturePayment({
+    const captureRes = await capturePayment({
       razorpayOrderId: orderId,
       razorpayPaymentId: paymentId,
       razorpaySignature: signature,

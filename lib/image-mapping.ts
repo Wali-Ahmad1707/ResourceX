@@ -335,7 +335,7 @@ export function resolveResourceImage(resource: {
       firstImg &&
       firstImg.trim() &&
       !LEGACY_REPETITIVE_PATHS.has(firstImg.trim()) &&
-      (firstImg.startsWith("/uploads/") || firstImg.startsWith("/images/resources/"))
+      (firstImg.startsWith("/uploads/") || firstImg.startsWith("/images/resources/") || firstImg.startsWith("http://") || firstImg.startsWith("https://"))
     ) {
       return firstImg.trim();
     }
@@ -395,7 +395,7 @@ export function resolveResourceGallery(resource: {
         img &&
         !gallery.includes(img) &&
         !LEGACY_REPETITIVE_PATHS.has(img) &&
-        (img.startsWith("/uploads/") || img.startsWith("/images/resources/"))
+        (img.startsWith("/uploads/") || img.startsWith("/images/resources/") || img.startsWith("http://") || img.startsWith("https://"))
       ) {
         gallery.push(img);
       }

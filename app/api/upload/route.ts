@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
+import { put } from "@vercel/blob";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
@@ -42,12 +43,6 @@ export async function POST(request: Request) {
       );
     }
 
-    // Ensure uploads directory exists
-    const uploadsDir = path.join(process.cwd(), "public", "uploads");
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
-    }
-
     // Determine extension
     let ext = ".jpg";
     if (file.type === "image/png") ext = ".png";
@@ -55,8 +50,28 @@ export async function POST(request: Request) {
     if (file.type === "image/gif") ext = ".gif";
 
     const fileName = `${Date.now()}_${crypto.randomBytes(8).toString("hex")}${ext}`;
-    const filePath = path.join(uploadsDir, fileName);
 
+    // 1. If Vercel Blob is configured (production / preview serverless deployment)
+    if (process.env.BLOB_READ_WRITE_TOKEN) {
+      const blob = await put(fileName, file, {
+        access: "public",
+        addRandomSuffix: true,
+      });
+
+      return NextResponse.json({
+        success: true,
+        url: blob.url,
+        fileName: blob.pathname || fileName,
+      });
+    }
+
+    // 2. Local filesystem storage fallback (offline testing & local development)
+    const uploadsDir = path.join(process.cwd(), "public", "uploads");
+    if (!fs.existsSync(uploadsDir)) {
+      fs.mkdirSync(uploadsDir, { recursive: true });
+    }
+
+    const filePath = path.join(uploadsDir, fileName);
     const buffer = Buffer.from(await file.arrayBuffer());
     fs.writeFileSync(filePath, buffer);
 

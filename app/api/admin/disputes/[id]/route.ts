@@ -15,7 +15,7 @@ export async function GET(
   }
 
   const { id } = await params;
-  const dispute = getDisputeById(id);
+  const dispute = await getDisputeById(id);
   if (!dispute) {
     return NextResponse.json(
       { error: "Dispute not found." },
@@ -44,7 +44,7 @@ export async function PATCH(
     const body = await req.json();
     const { status, assignedAdminId, adminNotes, resolution, actionTaken } = body;
 
-    const result = updateDisputeByAdmin(admin.id, id, {
+    const result = await updateDisputeByAdmin(admin.id, id, {
       status,
       assignedAdminId,
       adminNotes,

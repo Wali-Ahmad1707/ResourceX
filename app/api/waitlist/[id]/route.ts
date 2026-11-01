@@ -17,7 +17,7 @@ export async function DELETE(request: Request, { params }: RouteParams) {
     }
 
     const { id } = await params;
-    const result = leaveWaitlist(id, user.id);
+    const result = await leaveWaitlist(id, user.id);
 
     if (!result.success) {
       const status = result.error?.includes("Unauthorized") ? 403 : 400;

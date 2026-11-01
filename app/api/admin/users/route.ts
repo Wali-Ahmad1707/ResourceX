@@ -17,7 +17,7 @@ export async function GET(req: NextRequest) {
     const status = searchParams.get("status") || undefined;
     const search = searchParams.get("search") || undefined;
 
-    const rawUsers = getAllUsersForAdmin({ role, status, search });
+    const rawUsers = await getAllUsersForAdmin({ role, status, search });
     const users = rawUsers.map((u) => ({
       ...sanitizeUser(u),
       suspendedReason: u.suspendedReason || null,

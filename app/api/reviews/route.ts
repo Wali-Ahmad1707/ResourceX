@@ -14,7 +14,7 @@ export async function GET(request: NextRequest) {
     const userId = searchParams.get("userId");
 
     if (resourceId) {
-      const reviews = getReviewsForResource(resourceId);
+      const reviews = await getReviewsForResource(resourceId);
       return NextResponse.json({
         success: true,
         reviews,
@@ -23,8 +23,8 @@ export async function GET(request: NextRequest) {
     }
 
     if (userId) {
-      const reviews = getReviewsForUser(userId);
-      const summary = getUserRatingSummary(userId);
+      const reviews = await getReviewsForUser(userId);
+      const summary = await getUserRatingSummary(userId);
       return NextResponse.json({
         success: true,
         reviews,
@@ -81,7 +81,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const result = createReview({
+    const result = await createReview({
       bookingId,
       reviewerId: user.id,
       rating: Math.round(numRating),

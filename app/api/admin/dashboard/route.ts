@@ -12,7 +12,7 @@ export async function GET() {
   }
 
   try {
-    const metrics = getAdminDashboardMetrics();
+    const metrics = await getAdminDashboardMetrics();
     return NextResponse.json({ success: true, metrics });
   } catch (error: any) {
     console.error("[API_ADMIN_DASHBOARD_ERROR]", error);

@@ -12,7 +12,7 @@ export async function GET() {
   }
 
   try {
-    const settings = getAllPlatformSettings();
+    const settings = await getAllPlatformSettings();
     return NextResponse.json({ success: true, settings });
   } catch (error: any) {
     console.error("[API_ADMIN_SETTINGS_GET_ERROR]", error);
@@ -50,7 +50,7 @@ export async function PATCH(req: NextRequest) {
       );
     }
 
-    const result = updatePlatformSetting(admin.id, key, value);
+    const result = await updatePlatformSetting(admin.id, key, value);
     if (!result.success) {
       return NextResponse.json({ error: result.error }, { status: 400 });
     }

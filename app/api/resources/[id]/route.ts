@@ -32,7 +32,7 @@ const updateSchema = z.object({
 export async function GET(request: Request, { params }: RouteParams) {
   try {
     const { id } = await params;
-    const resource = getDbResourceById(id);
+    const resource = await getDbResourceById(id);
 
     if (!resource || resource.status === "deleted") {
       return NextResponse.json(
@@ -75,7 +75,7 @@ export async function PATCH(request: Request, { params }: RouteParams) {
       );
     }
 
-    const result = updateResource(id, user.id, parse.data);
+    const result = await updateResource(id, user.id, parse.data);
 
     if (!result.success) {
       const status = result.error?.includes("Unauthorized") ? 403 : 400;
@@ -110,7 +110,7 @@ export async function DELETE(request: Request, { params }: RouteParams) {
     }
 
     const { id } = await params;
-    const result = deleteResource(id, user.id);
+    const result = await deleteResource(id, user.id);
 
     if (!result.success) {
       const status = result.error?.includes("Unauthorized") ? 403 : 400;

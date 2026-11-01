@@ -12,7 +12,7 @@ export async function GET() {
   }
 
   try {
-    const categories = getAllPlatformCategories();
+    const categories = await getAllPlatformCategories();
     return NextResponse.json({ success: true, categories });
   } catch (error: any) {
     console.error("[API_ADMIN_CATEGORIES_ERROR]", error);
@@ -50,7 +50,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const result = createPlatformCategory(admin.id, {
+    const result = await createPlatformCategory(admin.id, {
       name,
       slug,
       description,

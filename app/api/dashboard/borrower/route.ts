@@ -26,12 +26,12 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const analytics = getBorrowerAnalytics(user.id);
-    const bookings = getBookingsByBorrower(user.id);
-    const waitlists = getWaitlistByBorrower(user.id);
-    const saved = getSavedResources(user.id);
-    const reviews = getReviewsForUser(user.id);
-    const trustProfile = getUserTrustProfile(user.id);
+    const analytics = await getBorrowerAnalytics(user.id);
+    const bookings = await getBookingsByBorrower(user.id);
+    const waitlists = await getWaitlistByBorrower(user.id);
+    const saved = await getSavedResources(user.id);
+    const reviews = await getReviewsForUser(user.id);
+    const trustProfile = await getUserTrustProfile(user.id);
 
     return NextResponse.json({
       success: true,

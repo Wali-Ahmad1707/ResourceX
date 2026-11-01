@@ -16,7 +16,7 @@ export async function GET(
 
   const { id } = await params;
   try {
-    const details = getUserDetailsForAdmin(id);
+    const details = await getUserDetailsForAdmin(id);
     if (!details.user) {
       return NextResponse.json(
         { error: "User not found." },
@@ -72,7 +72,7 @@ export async function PATCH(
         );
       }
 
-      const result = updateUserStatusByAdmin(admin.id, id, targetStatus, reason);
+      const result = await updateUserStatusByAdmin(admin.id, id, targetStatus, reason);
       if (!result.success) {
         return NextResponse.json({ error: result.error }, { status: 400 });
       }
@@ -93,7 +93,7 @@ export async function PATCH(
         );
       }
 
-      const result = updateUserRoleByAdmin(admin.id, id, role);
+      const result = await updateUserRoleByAdmin(admin.id, id, role);
       if (!result.success) {
         return NextResponse.json({ error: result.error }, { status: 400 });
       }

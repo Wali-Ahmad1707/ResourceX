@@ -25,7 +25,7 @@ export async function POST(request: Request, { params }: RouteParams) {
     }
 
     const { id } = await params;
-    const result = approveBooking(id, user.id);
+    const result = await approveBooking(id, user.id);
 
     if (!result.success) {
       const status = result.error?.includes("Unauthorized") ? 403 : 400;

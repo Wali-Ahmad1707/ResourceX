@@ -178,7 +178,7 @@ export async function getCurrentUser(): Promise<SanitizedUser | null> {
       return null;
     }
 
-    const user = findUserById(payload.userId);
+    const user = await findUserById(payload.userId);
     if (!user || user.status !== "active") {
       return null;
     }

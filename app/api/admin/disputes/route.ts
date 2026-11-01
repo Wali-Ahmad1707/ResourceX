@@ -15,7 +15,7 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const status = searchParams.get("status") || undefined;
 
-    const disputes = getDisputesForAdmin({ status });
+    const disputes = await getDisputesForAdmin({ status });
     return NextResponse.json({ success: true, disputes });
   } catch (error: any) {
     console.error("[API_ADMIN_DISPUTES_ERROR]", error);

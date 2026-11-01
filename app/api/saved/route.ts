@@ -21,14 +21,14 @@ export async function GET(request: Request) {
     const resourceId = searchParams.get("resourceId");
 
     if (resourceId) {
-      const isSaved = isResourceSaved(user.id, resourceId);
+      const isSaved = await isResourceSaved(user.id, resourceId);
       return NextResponse.json({
         success: true,
         isSaved,
       });
     }
 
-    const saved = getSavedResources(user.id);
+    const saved = await getSavedResources(user.id);
 
     return NextResponse.json({
       success: true,
@@ -65,7 +65,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const result = saveResource(user.id, parse.data.resourceId);
+    const result = await saveResource(user.id, parse.data.resourceId);
 
     if (!result.success) {
       return NextResponse.json(

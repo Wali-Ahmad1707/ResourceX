@@ -18,7 +18,7 @@ export async function POST(request: Request, { params }: RouteParams) {
     }
 
     const { id } = await params;
-    const result = cancelBooking(id, user.id);
+    const result = await cancelBooking(id, user.id);
 
     if (!result.success) {
       const status = result.error?.includes("Unauthorized") 

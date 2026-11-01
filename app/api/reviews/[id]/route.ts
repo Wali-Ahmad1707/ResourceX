@@ -42,7 +42,7 @@ export async function PATCH(
       updates.comment = comment.trim();
     }
 
-    const result = updateReview(id, user.id, updates);
+    const result = await updateReview(id, user.id, updates);
 
     if (!result.success) {
       const statusCode = result.error?.startsWith("Unauthorized") ? 403 : 400;

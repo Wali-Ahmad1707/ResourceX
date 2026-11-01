@@ -41,7 +41,7 @@ export async function POST(request: Request) {
     const { email, password, rememberMe } = result.data;
 
     // 1. Find user in persistent database
-    const user = findUserByEmail(email);
+    const user = await findUserByEmail(email);
     if (!user) {
       return NextResponse.json(
         { success: false, error: "Invalid email or password" },
@@ -68,7 +68,7 @@ export async function POST(request: Request) {
 
     // 4. Record login in audit log
     const now = new Date().toISOString();
-    createAuditLog({
+    await createAuditLog({
       id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       actorId: user.id,
       action: "USER_LOGGED_IN",

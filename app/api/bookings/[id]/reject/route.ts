@@ -42,7 +42,7 @@ export async function POST(request: Request, { params }: RouteParams) {
       // Body is optional
     }
 
-    const result = rejectBooking(id, user.id, reason);
+    const result = await rejectBooking(id, user.id, reason);
 
     if (!result.success) {
       const status = result.error?.includes("Unauthorized") ? 403 : 400;

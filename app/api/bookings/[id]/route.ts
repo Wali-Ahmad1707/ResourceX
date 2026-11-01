@@ -18,7 +18,7 @@ export async function GET(request: Request, { params }: RouteParams) {
     }
 
     const { id } = await params;
-    const booking = getBookingById(id);
+    const booking = await getBookingById(id);
 
     if (!booking) {
       return NextResponse.json(

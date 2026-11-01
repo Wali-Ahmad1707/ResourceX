@@ -38,7 +38,7 @@ export async function POST(request: Request) {
     }
 
     const { resourceId, startDate, endDate } = result.data;
-    const dbResource = getDbResourceById(resourceId);
+    const dbResource = await getDbResourceById(resourceId);
     const mockResource = getResourceById(resourceId);
     const resource = dbResource || mockResource;
 
@@ -49,7 +49,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const joinResult = joinWaitlist({
+    const joinResult = await joinWaitlist({
       resourceId,
       borrowerId: user.id,
       startDate,
@@ -95,7 +95,7 @@ export async function GET() {
       );
     }
 
-    const entries = getWaitlistByBorrower(user.id);
+    const entries = await getWaitlistByBorrower(user.id);
     const enriched = entries.map((w) => {
       const res = getResourceById(w.resourceId);
       return {

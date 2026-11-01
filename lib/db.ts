@@ -1,4 +1,4 @@
-import { DatabaseSync } from "node:sqlite";
+import { createClient, type Client } from "@libsql/client";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
@@ -387,37 +387,96 @@ export interface AdminPaymentMetrics {
 }
 
 // Ensure database directory exists
-const dataDir = path.join(process.cwd(), "data");
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+// LibSQL / Turso Database Client & Unified Wrapper
+export interface StatementWrapper {
+  get: <T = any>(...args: any[]) => Promise<T | null>;
+  all: <T = any>(...args: any[]) => Promise<T[]>;
+  run: (...args: any[]) => Promise<{ rowsAffected: number; changes: number; lastInsertRowid?: bigint | number }>;
 }
 
-const dbPath = path.join(dataDir, "resourcex.db");
+export interface LibSqlDbWrapper {
+  client: Client;
+  prepare: (sql: string) => StatementWrapper;
+  exec: (sql: string) => Promise<void>;
+  transaction: (mode?: "write" | "read" | "deferred") => Promise<any>;
+}
 
-// Global database instance caching for Next.js hot-reloading
+function flattenArgs(args: any[]): any[] {
+  if (args.length === 1 && Array.isArray(args[0])) return args[0];
+  return args;
+}
+
+export function createDbWrapper(client: Client): LibSqlDbWrapper {
+  return {
+    client,
+    prepare: (sql: string) => ({
+      get: async <T = any>(...args: any[]): Promise<T | null> => {
+        const res = await client.execute({ sql, args: flattenArgs(args) });
+        return res.rows[0] ? (res.rows[0] as unknown as T) : null;
+      },
+      all: async <T = any>(...args: any[]): Promise<T[]> => {
+        const res = await client.execute({ sql, args: flattenArgs(args) });
+        return (res.rows || []) as unknown as T[];
+      },
+      run: async (...args: any[]): Promise<{ rowsAffected: number; changes: number; lastInsertRowid?: bigint | number }> => {
+        const res = await client.execute({ sql, args: flattenArgs(args) });
+        return { rowsAffected: res.rowsAffected, changes: res.rowsAffected, lastInsertRowid: res.lastInsertRowid };
+      },
+    }),
+    exec: async (sql: string): Promise<void> => {
+      await client.executeMultiple(sql);
+    },
+    transaction: async (mode: "write" | "read" | "deferred" = "write") => {
+      return client.transaction(mode);
+    },
+  };
+}
+
 const globalForDb = globalThis as unknown as {
-  _resourcexDb?: DatabaseSync;
+  _resourcexDb?: LibSqlDbWrapper;
+  _resourcexClient?: Client;
+  _resourcexInitPromise?: Promise<LibSqlDbWrapper>;
+  _resourcexInitialized?: boolean;
 };
 
-export function getDatabase(): DatabaseSync {
-  if (!globalForDb._resourcexDb) {
-    const db = new DatabaseSync(dbPath);
-    
-    // Enable WAL mode & foreign keys for performance and data integrity
-    db.exec("PRAGMA journal_mode = WAL;");
-    db.exec("PRAGMA foreign_keys = ON;");
-
-    // Initialize Schema
-    initSchema(db);
-
-    globalForDb._resourcexDb = db;
+export async function getDatabase(): Promise<LibSqlDbWrapper> {
+  if (globalForDb._resourcexDb && globalForDb._resourcexInitialized) {
+    return globalForDb._resourcexDb;
   }
-  return globalForDb._resourcexDb;
+
+  if (!globalForDb._resourcexInitPromise) {
+    globalForDb._resourcexInitPromise = (async () => {
+      const url = process.env.TURSO_DATABASE_URL || "file:data/resourcex.db";
+      const authToken = process.env.TURSO_AUTH_TOKEN;
+
+      // Ensure local data dir exists only when using local file storage
+      if (url.startsWith("file:") && !url.includes(":memory:")) {
+        const filePath = url.replace(/^file:/, "");
+        const dir = path.dirname(filePath);
+        if (dir && dir !== "." && !fs.existsSync(dir)) {
+          try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+        }
+      }
+
+      const client = createClient({ url, authToken });
+      const wrapper = createDbWrapper(client);
+
+      // Initialize schema, migrations and seeds once
+      await initSchema(wrapper);
+
+      globalForDb._resourcexClient = client;
+      globalForDb._resourcexDb = wrapper;
+      globalForDb._resourcexInitialized = true;
+      return wrapper;
+    })();
+  }
+
+  return globalForDb._resourcexInitPromise;
 }
 
-function initSchema(db: DatabaseSync) {
+async function initSchema(db: LibSqlDbWrapper) {
   // 1. Users Table
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       fullName TEXT NOT NULL,
@@ -434,12 +493,12 @@ function initSchema(db: DatabaseSync) {
   `);
 
   // Index on email for fast lookups
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
   `);
 
   // 2. Audit Logs Table (per ARCHITECTURE.md Section 4 & 5)
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS audit_logs (
       id TEXT PRIMARY KEY,
       actorId TEXT NOT NULL,
@@ -452,12 +511,12 @@ function initSchema(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_audit_logs_actorId ON audit_logs(actorId);
   `);
 
   // 3. Bookings Table (Phase 4 Core Booking System)
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS bookings (
       id TEXT PRIMARY KEY,
       resourceId TEXT NOT NULL,
@@ -477,7 +536,7 @@ function initSchema(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_bookings_resourceId ON bookings(resourceId);
     CREATE INDEX IF NOT EXISTS idx_bookings_borrowerId ON bookings(borrowerId);
     CREATE INDEX IF NOT EXISTS idx_bookings_ownerId ON bookings(ownerId);
@@ -486,7 +545,7 @@ function initSchema(db: DatabaseSync) {
   `);
 
   // 4. Waitlist Table (Phase 4 Waitlist System)
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS waitlist (
       id TEXT PRIMARY KEY,
       resourceId TEXT NOT NULL,
@@ -501,14 +560,14 @@ function initSchema(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_waitlist_resourceId ON waitlist(resourceId);
     CREATE INDEX IF NOT EXISTS idx_waitlist_borrowerId ON waitlist(borrowerId);
     CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status);
   `);
 
   // 5. In-App Notifications Table (Phase 4 Notification System)
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS notifications (
       id TEXT PRIMARY KEY,
       userId TEXT NOT NULL,
@@ -522,13 +581,13 @@ function initSchema(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_notifications_userId ON notifications(userId);
     CREATE INDEX IF NOT EXISTS idx_notifications_isRead ON notifications(isRead);
   `);
 
   // 6. Resources Table (Phase 5 Persistent Resources)
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS resources (
       id TEXT PRIMARY KEY,
       ownerId TEXT NOT NULL,
@@ -558,7 +617,7 @@ function initSchema(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_resources_ownerId ON resources(ownerId);
     CREATE INDEX IF NOT EXISTS idx_resources_category ON resources(category);
     CREATE INDEX IF NOT EXISTS idx_resources_status ON resources(status);
@@ -566,7 +625,7 @@ function initSchema(db: DatabaseSync) {
   `);
 
   // 7. Saved Resources / Wishlist Table (Phase 5)
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS saved_resources (
       id TEXT PRIMARY KEY,
       userId TEXT NOT NULL,
@@ -578,13 +637,13 @@ function initSchema(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_saved_userId ON saved_resources(userId);
     CREATE INDEX IF NOT EXISTS idx_saved_resourceId ON saved_resources(resourceId);
   `);
 
   // 8. Reviews Table (Phase 5 Community Reviews)
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS reviews (
       id TEXT PRIMARY KEY,
       bookingId TEXT NOT NULL,
@@ -603,7 +662,7 @@ function initSchema(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_reviews_resourceId ON reviews(resourceId);
     CREATE INDEX IF NOT EXISTS idx_reviews_revieweeId ON reviews(revieweeId);
     CREATE INDEX IF NOT EXISTS idx_reviews_reviewerId ON reviews(reviewerId);
@@ -611,59 +670,59 @@ function initSchema(db: DatabaseSync) {
   `);
 
   // 9. Apply Phase 6 non-destructive column migrations & new tables
-  applyPhase6Migrations(db);
+  await applyPhase6Migrations(db);
 
   // 10. Apply Phase 7 payments, deposits, refunds & webhooks migrations
-  applyPhase7Migrations(db);
+  await applyPhase7Migrations(db);
 
   // Seed default demo accounts if not already present
-  seedDemoUsers(db);
+  await seedDemoUsers(db);
 
   // Seed resources from catalog if no resources exist
-  seedResources(db);
+  await seedResources(db);
 
   // Seed default platform categories if empty
-  seedPlatformCategories(db);
+  await seedPlatformCategories(db);
 
   // Seed default platform settings if empty
-  seedPlatformSettings(db);
+  await seedPlatformSettings(db);
 }
 
-function applyPhase6Migrations(db: DatabaseSync) {
+async function applyPhase6Migrations(db: LibSqlDbWrapper) {
   // Check users table columns
-  const userColumns = db.prepare("PRAGMA table_info(users);").all() as { name: string }[];
+  const userColumns = await db.prepare("PRAGMA table_info(users);").all() as { name: string }[];
   const userColNames = new Set(userColumns.map((c) => c.name));
 
   if (!userColNames.has("suspendedReason")) {
-    db.exec("ALTER TABLE users ADD COLUMN suspendedReason TEXT;");
+    await db.exec("ALTER TABLE users ADD COLUMN suspendedReason TEXT;");
   }
   if (!userColNames.has("suspendedAt")) {
-    db.exec("ALTER TABLE users ADD COLUMN suspendedAt TEXT;");
+    await db.exec("ALTER TABLE users ADD COLUMN suspendedAt TEXT;");
   }
   if (!userColNames.has("suspendedBy")) {
-    db.exec("ALTER TABLE users ADD COLUMN suspendedBy TEXT;");
+    await db.exec("ALTER TABLE users ADD COLUMN suspendedBy TEXT;");
   }
 
   // Check resources table columns
-  const resourceColumns = db.prepare("PRAGMA table_info(resources);").all() as { name: string }[];
+  const resourceColumns = await db.prepare("PRAGMA table_info(resources);").all() as { name: string }[];
   const resourceColNames = new Set(resourceColumns.map((c) => c.name));
 
   if (!resourceColNames.has("moderationStatus")) {
-    db.exec("ALTER TABLE resources ADD COLUMN moderationStatus TEXT NOT NULL DEFAULT 'approved';");
+    await db.exec("ALTER TABLE resources ADD COLUMN moderationStatus TEXT NOT NULL DEFAULT 'approved';");
   }
   if (!resourceColNames.has("moderationReason")) {
-    db.exec("ALTER TABLE resources ADD COLUMN moderationReason TEXT;");
+    await db.exec("ALTER TABLE resources ADD COLUMN moderationReason TEXT;");
   }
   if (!resourceColNames.has("moderatedBy")) {
-    db.exec("ALTER TABLE resources ADD COLUMN moderatedBy TEXT;");
+    await db.exec("ALTER TABLE resources ADD COLUMN moderatedBy TEXT;");
   }
   if (!resourceColNames.has("moderatedAt")) {
-    db.exec("ALTER TABLE resources ADD COLUMN moderatedAt TEXT;");
+    await db.exec("ALTER TABLE resources ADD COLUMN moderatedAt TEXT;");
   }
 
   // Phase 6 Tables
   // 1. Booking Disputes
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS booking_disputes (
       id TEXT PRIMARY KEY,
       bookingId TEXT NOT NULL,
@@ -687,7 +746,7 @@ function applyPhase6Migrations(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_disputes_bookingId ON booking_disputes(bookingId);
     CREATE INDEX IF NOT EXISTS idx_disputes_initiatorId ON booking_disputes(initiatorId);
     CREATE INDEX IF NOT EXISTS idx_disputes_respondentId ON booking_disputes(respondentId);
@@ -695,7 +754,7 @@ function applyPhase6Migrations(db: DatabaseSync) {
   `);
 
   // 2. User Reports
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS user_reports (
       id TEXT PRIMARY KEY,
       reporterId TEXT NOT NULL,
@@ -717,14 +776,14 @@ function applyPhase6Migrations(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_reports_reporterId ON user_reports(reporterId);
     CREATE INDEX IF NOT EXISTS idx_reports_target ON user_reports(targetType, targetId);
     CREATE INDEX IF NOT EXISTS idx_reports_status ON user_reports(status);
   `);
 
   // 3. Platform Categories
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS platform_categories (
       id TEXT PRIMARY KEY,
       name TEXT UNIQUE NOT NULL,
@@ -738,13 +797,13 @@ function applyPhase6Migrations(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_platform_categories_slug ON platform_categories(slug);
     CREATE INDEX IF NOT EXISTS idx_platform_categories_active ON platform_categories(isActive);
   `);
 
   // 4. Platform Settings
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS platform_settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
@@ -756,7 +815,7 @@ function applyPhase6Migrations(db: DatabaseSync) {
   `);
 
   // 5. Resource Moderation History
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS resource_moderation_history (
       id TEXT PRIMARY KEY,
       resourceId TEXT NOT NULL,
@@ -770,26 +829,26 @@ function applyPhase6Migrations(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_moderation_resourceId ON resource_moderation_history(resourceId);
   `);
 }
 
-function applyPhase7Migrations(db: DatabaseSync) {
+async function applyPhase7Migrations(db: LibSqlDbWrapper) {
   // Check bookings table columns for depositStatus and depositPaidAt
-  const bookingColumns = db.prepare("PRAGMA table_info(bookings);").all() as { name: string }[];
+  const bookingColumns = await db.prepare("PRAGMA table_info(bookings);").all() as { name: string }[];
   const bookingColNames = new Set(bookingColumns.map((c) => c.name));
 
   if (!bookingColNames.has("depositStatus")) {
-    db.exec("ALTER TABLE bookings ADD COLUMN depositStatus TEXT NOT NULL DEFAULT 'awaiting_payment';");
+    await db.exec("ALTER TABLE bookings ADD COLUMN depositStatus TEXT NOT NULL DEFAULT 'awaiting_payment';");
   }
   if (!bookingColNames.has("depositPaidAt")) {
-    db.exec("ALTER TABLE bookings ADD COLUMN depositPaidAt TEXT;");
+    await db.exec("ALTER TABLE bookings ADD COLUMN depositPaidAt TEXT;");
   }
 
   // Phase 7 Tables
   // 1. Payments Table
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS payments (
       id TEXT PRIMARY KEY,
       userId TEXT NOT NULL,
@@ -814,7 +873,7 @@ function applyPhase7Migrations(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_payments_userId ON payments(userId);
     CREATE INDEX IF NOT EXISTS idx_payments_bookingId ON payments(bookingId);
     CREATE INDEX IF NOT EXISTS idx_payments_resourceId ON payments(resourceId);
@@ -825,7 +884,7 @@ function applyPhase7Migrations(db: DatabaseSync) {
   `);
 
   // 2. Refunds Table
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS refunds (
       id TEXT PRIMARY KEY,
       paymentId TEXT NOT NULL,
@@ -845,7 +904,7 @@ function applyPhase7Migrations(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_refunds_paymentId ON refunds(paymentId);
     CREATE INDEX IF NOT EXISTS idx_refunds_bookingId ON refunds(bookingId);
     CREATE INDEX IF NOT EXISTS idx_refunds_status ON refunds(status);
@@ -853,7 +912,7 @@ function applyPhase7Migrations(db: DatabaseSync) {
   `);
 
   // 3. Payment Webhook Events Table
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS payment_webhook_events (
       id TEXT PRIMARY KEY,
       eventId TEXT UNIQUE,
@@ -865,14 +924,14 @@ function applyPhase7Migrations(db: DatabaseSync) {
     );
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_webhooks_eventId ON payment_webhook_events(eventId);
     CREATE INDEX IF NOT EXISTS idx_webhooks_processingStatus ON payment_webhook_events(processingStatus);
   `);
 }
 
-function seedResources(db: DatabaseSync) {
-  const countRow = db.prepare("SELECT COUNT(*) as count FROM resources;").get() as { count: number };
+async function seedResources(db: LibSqlDbWrapper) {
+  const countRow = await db.prepare("SELECT COUNT(*) as count FROM resources;").get() as { count: number };
   if (countRow && countRow.count > 0) {
     return;
   }
@@ -895,7 +954,7 @@ function seedResources(db: DatabaseSync) {
     let ownerId = "usr_demo_owner_01";
     if (r.owner.name === "Elena Rostova") ownerId = "usr_demo_borrower_01";
 
-    insert.run(
+    await insert.run(
       r.id,
       ownerId,
       r.title,
@@ -923,7 +982,7 @@ function seedResources(db: DatabaseSync) {
   }
 }
 
-function seedDemoUsers(db: DatabaseSync) {
+async function seedDemoUsers(db: LibSqlDbWrapper) {
   // 1. NEVER create demo accounts in production environment
   if (process.env.NODE_ENV === "production") {
     return;
@@ -948,13 +1007,13 @@ function seedDemoUsers(db: DatabaseSync) {
   // Demo Borrower: Elena Rostova (only created if password is provided via env)
   if (borrowerPass && borrowerPass.trim().length > 0) {
     const borrowerId = "usr_demo_borrower_01";
-    const borrowerExists = db.prepare("SELECT id FROM users WHERE email = ?").get("borrower@resourcex.com");
+    const borrowerExists = await db.prepare("SELECT id FROM users WHERE email = ?").get("borrower@resourcex.com");
     if (!borrowerExists) {
       const borrowerSalt = crypto.randomBytes(16).toString("hex");
       const borrowerHash = crypto.scryptSync(borrowerPass.trim(), borrowerSalt, 64).toString("hex");
       const borrowerPassHash = `${borrowerSalt}:${borrowerHash}`;
       
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO users (id, fullName, email, phone, passwordHash, role, avatar, verified, status, createdAt, updatedAt)
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, ?)
       `).run(
@@ -969,7 +1028,7 @@ function seedDemoUsers(db: DatabaseSync) {
         now
       );
 
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO audit_logs (id, actorId, action, entityType, entityId, details, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(
@@ -987,13 +1046,13 @@ function seedDemoUsers(db: DatabaseSync) {
   // Demo Owner: Marcus Vance (only created if password is provided via env)
   if (ownerPass && ownerPass.trim().length > 0) {
     const ownerId = "usr_demo_owner_01";
-    const ownerExists = db.prepare("SELECT id FROM users WHERE email = ?").get("owner@resourcex.com");
+    const ownerExists = await db.prepare("SELECT id FROM users WHERE email = ?").get("owner@resourcex.com");
     if (!ownerExists) {
       const ownerSalt = crypto.randomBytes(16).toString("hex");
       const ownerHash = crypto.scryptSync(ownerPass.trim(), ownerSalt, 64).toString("hex");
       const ownerPassHash = `${ownerSalt}:${ownerHash}`;
       
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO users (id, fullName, email, phone, passwordHash, role, avatar, verified, status, createdAt, updatedAt)
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, ?)
       `).run(
@@ -1008,7 +1067,7 @@ function seedDemoUsers(db: DatabaseSync) {
         now
       );
 
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO audit_logs (id, actorId, action, entityType, entityId, details, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(
@@ -1026,13 +1085,13 @@ function seedDemoUsers(db: DatabaseSync) {
   // Demo Admin: ResourceX Admin (only created if password is provided via env)
   if (adminPass && adminPass.trim().length > 0) {
     const adminId = "usr_demo_admin_01";
-    const adminExists = db.prepare("SELECT id FROM users WHERE email = ?").get("admin@resourcex.com");
+    const adminExists = await db.prepare("SELECT id FROM users WHERE email = ?").get("admin@resourcex.com");
     if (!adminExists) {
       const adminSalt = crypto.randomBytes(16).toString("hex");
       const adminHash = crypto.scryptSync(adminPass.trim(), adminSalt, 64).toString("hex");
       const adminPassHash = `${adminSalt}:${adminHash}`;
 
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO users (id, fullName, email, phone, passwordHash, role, avatar, verified, status, createdAt, updatedAt)
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, ?)
       `).run(
@@ -1047,7 +1106,7 @@ function seedDemoUsers(db: DatabaseSync) {
         now
       );
 
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO audit_logs (id, actorId, action, entityType, entityId, details, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(
@@ -1063,8 +1122,8 @@ function seedDemoUsers(db: DatabaseSync) {
   }
 }
 
-function seedPlatformCategories(db: DatabaseSync) {
-  const countRow = db.prepare("SELECT COUNT(*) as count FROM platform_categories;").get() as { count: number };
+async function seedPlatformCategories(db: LibSqlDbWrapper) {
+  const countRow = await db.prepare("SELECT COUNT(*) as count FROM platform_categories;").get() as { count: number };
   if (countRow && countRow.count > 0) return;
 
   const now = new Date().toISOString();
@@ -1088,12 +1147,12 @@ function seedPlatformCategories(db: DatabaseSync) {
   ];
 
   for (const cat of defaultCategories) {
-    insert.run(cat.id, cat.name, cat.slug, cat.description, cat.icon, cat.order, now, now);
+    await insert.run(cat.id, cat.name, cat.slug, cat.description, cat.icon, cat.order, now, now);
   }
 }
 
-function seedPlatformSettings(db: DatabaseSync) {
-  const countRow = db.prepare("SELECT COUNT(*) as count FROM platform_settings;").get() as { count: number };
+async function seedPlatformSettings(db: LibSqlDbWrapper) {
+  const countRow = await db.prepare("SELECT COUNT(*) as count FROM platform_settings;").get() as { count: number };
   if (countRow && countRow.count > 0) return;
 
   const now = new Date().toISOString();
@@ -1112,28 +1171,28 @@ function seedPlatformSettings(db: DatabaseSync) {
   ];
 
   for (const s of defaults) {
-    insert.run(s.key, s.value, s.description, s.category, now);
+    await insert.run(s.key, s.value, s.description, s.category, now);
   }
 }
 
 // User DAO Methods
-export function findUserByEmail(email: string): DbUser | null {
-  const db = getDatabase();
-  const row = db.prepare("SELECT * FROM users WHERE email = ?").get(email.toLowerCase().trim()) as DbUser | undefined;
+export async function findUserByEmail(email: string): Promise<DbUser | null> {
+  const db = await getDatabase();
+  const row = await db.prepare("SELECT * FROM users WHERE email = ?").get(email.toLowerCase().trim()) as DbUser | undefined;
   return row || null;
 }
 
-export function findUserById(id: string): DbUser | null {
-  const db = getDatabase();
-  const row = db.prepare("SELECT * FROM users WHERE id = ?").get(id) as DbUser | undefined;
+export async function findUserById(id: string): Promise<DbUser | null> {
+  const db = await getDatabase();
+  const row = await db.prepare("SELECT * FROM users WHERE id = ?").get(id) as DbUser | undefined;
   return row || null;
 }
 
-export function createUser(user: Omit<DbUser, "verified" | "status" | "createdAt" | "updatedAt">): DbUser {
-  const db = getDatabase();
+export async function createUser(user: Omit<DbUser, "verified" | "status" | "createdAt" | "updatedAt">): Promise<DbUser> {
+  const db = await getDatabase();
   const now = new Date().toISOString();
   
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO users (id, fullName, email, phone, passwordHash, role, avatar, verified, status, createdAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, ?)
   `).run(
@@ -1149,7 +1208,7 @@ export function createUser(user: Omit<DbUser, "verified" | "status" | "createdAt
   );
 
   // Record in audit log
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: user.id,
     action: "USER_REGISTERED",
@@ -1159,12 +1218,12 @@ export function createUser(user: Omit<DbUser, "verified" | "status" | "createdAt
     timestamp: now,
   });
 
-  return findUserById(user.id)!;
+  return (await findUserById(user.id))!;
 }
 
-export function updateUser(id: string, updates: Partial<Pick<DbUser, "fullName" | "phone" | "avatar" | "passwordHash">>): DbUser | null {
-  const db = getDatabase();
-  const existing = findUserById(id);
+export async function updateUser(id: string, updates: Partial<Pick<DbUser, "fullName" | "phone" | "avatar" | "passwordHash">>): Promise<DbUser | null> {
+  const db = await getDatabase();
+  const existing = await findUserById(id);
   if (!existing) return null;
 
   const now = new Date().toISOString();
@@ -1173,13 +1232,13 @@ export function updateUser(id: string, updates: Partial<Pick<DbUser, "fullName" 
   const avatar = updates.avatar !== undefined ? updates.avatar : existing.avatar;
   const passwordHash = updates.passwordHash !== undefined ? updates.passwordHash : existing.passwordHash;
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE users 
     SET fullName = ?, phone = ?, avatar = ?, passwordHash = ?, updatedAt = ?
     WHERE id = ?
   `).run(fullName, phone, avatar, passwordHash, now, id);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: id,
     action: "USER_PROFILE_UPDATED",
@@ -1189,20 +1248,20 @@ export function updateUser(id: string, updates: Partial<Pick<DbUser, "fullName" 
     timestamp: now,
   });
 
-  return findUserById(id);
+  return await findUserById(id);
 }
 
-export function createAuditLog(log: DbAuditLog): void {
-  const db = getDatabase();
-  db.prepare(`
+export async function createAuditLog(log: DbAuditLog): Promise<void> {
+  const db = await getDatabase();
+  await db.prepare(`
     INSERT INTO audit_logs (id, actorId, action, entityType, entityId, details, timestamp)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(log.id, log.actorId, log.action, log.entityType, log.entityId, log.details, log.timestamp);
 }
 
-export function getUserAuditLogs(userId: string, limit = 5): DbAuditLog[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getUserAuditLogs(userId: string, limit = 5): Promise<DbAuditLog[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT * FROM audit_logs WHERE actorId = ? ORDER BY timestamp DESC LIMIT ?
   `).all(userId, limit) as unknown as DbAuditLog[];
   return rows || [];
@@ -1212,7 +1271,7 @@ export function getUserAuditLogs(userId: string, limit = 5): DbAuditLog[] {
 // PHASE 4: BOOKINGS SYSTEM DAO METHODS
 // ==========================================
 
-export function createBooking(params: {
+export async function createBooking(params: {
   resourceId: string;
   borrowerId: string;
   ownerId: string;
@@ -1222,8 +1281,8 @@ export function createBooking(params: {
   message?: string;
   pickupPreference?: string;
   resourceTitle?: string;
-}): { success: boolean; booking?: DbBooking; error?: string } {
-  const db = getDatabase();
+}): Promise<{ success: boolean; booking?: DbBooking; error?: string }> {
+  const db = await getDatabase();
 
   // Validate dates
   const today = new Date().toISOString().split("T")[0];
@@ -1235,7 +1294,7 @@ export function createBooking(params: {
   }
 
   // 1. Check for overlapping approved bookings for this resource
-  const overlappingApproved = db.prepare(`
+  const overlappingApproved = await db.prepare(`
     SELECT * FROM bookings 
     WHERE resourceId = ? 
       AND status = 'approved' 
@@ -1251,7 +1310,7 @@ export function createBooking(params: {
   }
 
   // 2. Prevent duplicate active booking request by same borrower for overlapping dates
-  const duplicateRequest = db.prepare(`
+  const duplicateRequest = await db.prepare(`
     SELECT * FROM bookings 
     WHERE resourceId = ? 
       AND borrowerId = ? 
@@ -1270,7 +1329,7 @@ export function createBooking(params: {
   const now = new Date().toISOString();
   const bookingId = `bk_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO bookings (
       id, resourceId, borrowerId, ownerId, startDate, endDate, 
       purpose, message, pickupPreference, status, createdAt, updatedAt
@@ -1290,7 +1349,7 @@ export function createBooking(params: {
   );
 
   // Audit event
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: params.borrowerId,
     action: "BOOKING_REQUESTED",
@@ -1306,7 +1365,7 @@ export function createBooking(params: {
   });
 
   // Notify Owner
-  createNotification({
+  await createNotification({
     userId: params.ownerId,
     title: "New Booking Request",
     message: `You have received a new booking request for ${params.resourceTitle || "your equipment"} (${params.startDate} to ${params.endDate}).`,
@@ -1314,13 +1373,13 @@ export function createBooking(params: {
     relatedEntityId: bookingId,
   });
 
-  const created = getBookingById(bookingId);
+  const created = await getBookingById(bookingId);
   return { success: true, booking: created! };
 }
 
-export function getBookingById(id: string): DbBookingWithDetails | null {
-  const db = getDatabase();
-  const row = db.prepare(`
+export async function getBookingById(id: string): Promise<DbBookingWithDetails | null> {
+  const db = await getDatabase();
+  const row = await db.prepare(`
     SELECT 
       b.*,
       u1.fullName as borrowerName,
@@ -1337,8 +1396,8 @@ export function getBookingById(id: string): DbBookingWithDetails | null {
   return row || null;
 }
 
-export function getBookingsByBorrower(borrowerId: string, status?: BookingStatus): DbBookingWithDetails[] {
-  const db = getDatabase();
+export async function getBookingsByBorrower(borrowerId: string, status?: BookingStatus): Promise<DbBookingWithDetails[]> {
+  const db = await getDatabase();
   let query = `
     SELECT 
       b.*,
@@ -1356,11 +1415,11 @@ export function getBookingsByBorrower(borrowerId: string, status?: BookingStatus
   }
 
   query += " ORDER BY b.createdAt DESC";
-  return db.prepare(query).all(...params) as unknown as DbBookingWithDetails[];
+  return await db.prepare(query).all(...params) as unknown as DbBookingWithDetails[];
 }
 
-export function getBookingsByOwner(ownerId: string, status?: BookingStatus): DbBookingWithDetails[] {
-  const db = getDatabase();
+export async function getBookingsByOwner(ownerId: string, status?: BookingStatus): Promise<DbBookingWithDetails[]> {
+  const db = await getDatabase();
   let query = `
     SELECT 
       b.*,
@@ -1379,34 +1438,34 @@ export function getBookingsByOwner(ownerId: string, status?: BookingStatus): DbB
   }
 
   query += " ORDER BY b.createdAt DESC";
-  return db.prepare(query).all(...params) as unknown as DbBookingWithDetails[];
+  return await db.prepare(query).all(...params) as unknown as DbBookingWithDetails[];
 }
 
-export function getResourceApprovedBookings(resourceId: string): DbBooking[] {
-  const db = getDatabase();
-  return db.prepare(`
+export async function getResourceApprovedBookings(resourceId: string): Promise<DbBooking[]> {
+  const db = await getDatabase();
+  return await db.prepare(`
     SELECT * FROM bookings 
     WHERE resourceId = ? AND status = 'approved' 
     ORDER BY startDate ASC
   `).all(resourceId) as unknown as DbBooking[];
 }
 
-export function getResourceAllActiveBookings(resourceId: string): DbBooking[] {
-  const db = getDatabase();
-  return db.prepare(`
+export async function getResourceAllActiveBookings(resourceId: string): Promise<DbBooking[]> {
+  const db = await getDatabase();
+  return await db.prepare(`
     SELECT * FROM bookings 
     WHERE resourceId = ? AND status IN ('pending', 'approved') 
     ORDER BY startDate ASC
   `).all(resourceId) as unknown as DbBooking[];
 }
 
-export function approveBooking(
+export async function approveBooking(
   bookingId: string, 
   ownerId: string,
   resourceTitle?: string
-): { success: boolean; booking?: DbBooking; error?: string } {
-  const db = getDatabase();
-  const booking = getBookingById(bookingId);
+): Promise<{ success: boolean; booking?: DbBooking; error?: string }> {
+  const db = await getDatabase();
+  const booking = await getBookingById(bookingId);
 
   if (!booking) {
     return { success: false, error: "Booking request not found." };
@@ -1420,22 +1479,25 @@ export function approveBooking(
     return { success: false, error: `Cannot approve request with current status: ${booking.status}.` };
   }
 
-  // Use SQLite transaction to safely recheck availability and approve atomically
-  db.exec("BEGIN IMMEDIATE TRANSACTION;");
+  // Use LibSQL transaction to safely recheck availability and approve atomically
+  const tx = await db.transaction("write");
 
   try {
     // Recheck overlapping approved bookings
-    const overlapping = db.prepare(`
-      SELECT * FROM bookings 
-      WHERE resourceId = ? 
-        AND status = 'approved' 
-        AND id != ? 
-        AND startDate <= ? 
-        AND endDate >= ?
-    `).all(booking.resourceId, booking.id, booking.endDate, booking.startDate) as unknown as DbBooking[];
+    const overlappingRes = await tx.execute({
+      sql: `
+        SELECT * FROM bookings 
+        WHERE resourceId = ? 
+          AND status = 'approved' 
+          AND id != ? 
+          AND startDate <= ? 
+          AND endDate >= ?
+      `,
+      args: [booking.resourceId, booking.id, booking.endDate, booking.startDate]
+    });
 
-    if (overlapping.length > 0) {
-      db.exec("ROLLBACK;");
+    if (overlappingRes.rows.length > 0) {
+      await tx.rollback();
       return { 
         success: false, 
         error: "Conflict: Another approved booking overlaps with these requested dates." 
@@ -1443,16 +1505,19 @@ export function approveBooking(
     }
 
     const now = new Date().toISOString();
-    db.prepare(`
-      UPDATE bookings 
-      SET status = 'approved', updatedAt = ?
-      WHERE id = ?
-    `).run(now, bookingId);
+    await tx.execute({
+      sql: `
+        UPDATE bookings 
+        SET status = 'approved', updatedAt = ?
+        WHERE id = ?
+      `,
+      args: [now, bookingId]
+    });
 
-    db.exec("COMMIT;");
+    await tx.commit();
 
     // Audit log
-    createAuditLog({
+    await createAuditLog({
       id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       actorId: ownerId,
       action: "BOOKING_APPROVED",
@@ -1463,7 +1528,7 @@ export function approveBooking(
     });
 
     // Notify Borrower
-    createNotification({
+    await createNotification({
       userId: booking.borrowerId,
       title: "Booking Request Approved!",
       message: `Your booking request for ${resourceTitle || "the resource"} (${booking.startDate} to ${booking.endDate}) has been approved.`,
@@ -1471,21 +1536,21 @@ export function approveBooking(
       relatedEntityId: bookingId,
     });
 
-    return { success: true, booking: getBookingById(bookingId)! };
+    return { success: true, booking: (await getBookingById(bookingId)) || undefined };
   } catch (err: any) {
-    try { db.exec("ROLLBACK;"); } catch {}
+    try { await tx.rollback(); } catch {}
     return { success: false, error: err.message || "Failed to approve booking." };
   }
 }
 
-export function rejectBooking(
+export async function rejectBooking(
   bookingId: string, 
   ownerId: string, 
   reason?: string,
   resourceTitle?: string
-): { success: boolean; booking?: DbBooking; error?: string } {
-  const db = getDatabase();
-  const booking = getBookingById(bookingId);
+): Promise<{ success: boolean; booking?: DbBooking; error?: string }> {
+  const db = await getDatabase();
+  const booking = await getBookingById(bookingId);
 
   if (!booking) {
     return { success: false, error: "Booking request not found." };
@@ -1500,13 +1565,13 @@ export function rejectBooking(
   }
 
   const now = new Date().toISOString();
-  db.prepare(`
+  await db.prepare(`
     UPDATE bookings 
     SET status = 'rejected', rejectionReason = ?, updatedAt = ?
     WHERE id = ?
   `).run(reason ? reason.trim() : null, now, bookingId);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: ownerId,
     action: "BOOKING_REJECTED",
@@ -1516,7 +1581,7 @@ export function rejectBooking(
     timestamp: now,
   });
 
-  createNotification({
+  await createNotification({
     userId: booking.borrowerId,
     title: "Booking Request Declined",
     message: `Your booking request for ${resourceTitle || "the resource"} was declined. ${reason ? "Reason: " + reason : ""}`,
@@ -1524,16 +1589,16 @@ export function rejectBooking(
     relatedEntityId: bookingId,
   });
 
-  return { success: true, booking: getBookingById(bookingId)! };
+  return { success: true, booking: (await getBookingById(bookingId)) || undefined };
 }
 
-export function cancelBooking(
+export async function cancelBooking(
   bookingId: string, 
   userId: string,
   resourceTitle?: string
-): { success: boolean; booking?: DbBooking; error?: string } {
-  const db = getDatabase();
-  const booking = getBookingById(bookingId);
+): Promise<{ success: boolean; booking?: DbBooking; error?: string }> {
+  const db = await getDatabase();
+  const booking = await getBookingById(bookingId);
 
   if (!booking) {
     return { success: false, error: "Booking not found." };
@@ -1553,13 +1618,13 @@ export function cancelBooking(
   const wasApproved = booking.status === "approved";
   const now = new Date().toISOString();
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE bookings 
     SET status = 'cancelled', updatedAt = ?
     WHERE id = ?
   `).run(now, bookingId);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: userId,
     action: "BOOKING_CANCELLED",
@@ -1571,7 +1636,7 @@ export function cancelBooking(
 
   // Notify the other party
   const notifyTargetId = isBorrower ? booking.ownerId : booking.borrowerId;
-  createNotification({
+  await createNotification({
     userId: notifyTargetId,
     title: "Booking Cancelled",
     message: `The booking for ${resourceTitle || "the resource"} (${booking.startDate} to ${booking.endDate}) was cancelled by the ${isBorrower ? "borrower" : "owner"}.`,
@@ -1581,18 +1646,18 @@ export function cancelBooking(
 
   // WAITLIST TRIGGER: If an approved booking was cancelled, notify eligible waitlist users!
   if (wasApproved) {
-    triggerWaitlistNotifications(booking.resourceId, booking.startDate, booking.endDate, resourceTitle);
+    await triggerWaitlistNotifications(booking.resourceId, booking.startDate, booking.endDate, resourceTitle);
   }
 
-  return { success: true, booking: getBookingById(bookingId)! };
+  return { success: true, booking: (await getBookingById(bookingId)) || undefined };
 }
 
-export function completeBooking(
+export async function completeBooking(
   bookingId: string, 
   ownerId: string
-): { success: boolean; booking?: DbBooking; error?: string } {
-  const db = getDatabase();
-  const booking = getBookingById(bookingId);
+): Promise<{ success: boolean; booking?: DbBooking; error?: string }> {
+  const db = await getDatabase();
+  const booking = await getBookingById(bookingId);
 
   if (!booking) {
     return { success: false, error: "Booking not found." };
@@ -1607,13 +1672,13 @@ export function completeBooking(
   }
 
   const now = new Date().toISOString();
-  db.prepare(`
+  await db.prepare(`
     UPDATE bookings 
     SET status = 'completed', updatedAt = ?
     WHERE id = ?
   `).run(now, bookingId);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: ownerId,
     action: "BOOKING_COMPLETED",
@@ -1623,21 +1688,21 @@ export function completeBooking(
     timestamp: now,
   });
 
-  return { success: true, booking: getBookingById(bookingId)! };
+  return { success: true, booking: (await getBookingById(bookingId)) || undefined };
 }
 
 // ==========================================
 // PHASE 4: WAITLIST SYSTEM DAO METHODS
 // ==========================================
 
-export function joinWaitlist(params: {
+export async function joinWaitlist(params: {
   resourceId: string;
   borrowerId: string;
   startDate: string;
   endDate: string;
   resourceTitle?: string;
-}): { success: boolean; waitlist?: DbWaitlist; error?: string } {
-  const db = getDatabase();
+}): Promise<{ success: boolean; waitlist?: DbWaitlist; error?: string }> {
+  const db = await getDatabase();
 
   const today = new Date().toISOString().split("T")[0];
   if (params.startDate < today) {
@@ -1648,7 +1713,7 @@ export function joinWaitlist(params: {
   }
 
   // Check duplicate active waitlist entry
-  const existing = db.prepare(`
+  const existing = await db.prepare(`
     SELECT * FROM waitlist 
     WHERE resourceId = ? AND borrowerId = ? AND status = 'active'
   `).get(params.resourceId, params.borrowerId) as DbWaitlist | undefined;
@@ -1661,7 +1726,7 @@ export function joinWaitlist(params: {
   }
 
   // Determine queue position
-  const activeCountRow = db.prepare(`
+  const activeCountRow = await db.prepare(`
     SELECT COUNT(*) as activeCount FROM waitlist 
     WHERE resourceId = ? AND status = 'active'
   `).get(params.resourceId) as { activeCount: number };
@@ -1670,7 +1735,7 @@ export function joinWaitlist(params: {
   const now = new Date().toISOString();
   const waitlistId = `wt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO waitlist (id, resourceId, borrowerId, startDate, endDate, status, position, createdAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
   `).run(
@@ -1684,7 +1749,7 @@ export function joinWaitlist(params: {
     now
   );
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: params.borrowerId,
     action: "WAITLIST_JOINED",
@@ -1694,7 +1759,7 @@ export function joinWaitlist(params: {
     timestamp: now,
   });
 
-  createNotification({
+  await createNotification({
     userId: params.borrowerId,
     title: "Joined Resource Waitlist",
     message: `You are in position #${position} on the waitlist for ${params.resourceTitle || "this resource"}. We will notify you if dates become available.`,
@@ -1702,16 +1767,16 @@ export function joinWaitlist(params: {
     relatedEntityId: waitlistId,
   });
 
-  const created = db.prepare("SELECT * FROM waitlist WHERE id = ?").get(waitlistId) as unknown as DbWaitlist;
+  const created = await db.prepare("SELECT * FROM waitlist WHERE id = ?").get(waitlistId) as unknown as DbWaitlist;
   return { success: true, waitlist: created };
 }
 
-export function leaveWaitlist(
+export async function leaveWaitlist(
   waitlistId: string, 
   borrowerId: string
-): { success: boolean; error?: string } {
-  const db = getDatabase();
-  const entry = db.prepare("SELECT * FROM waitlist WHERE id = ?").get(waitlistId) as unknown as DbWaitlist | undefined;
+): Promise<{ success: boolean; error?: string }> {
+  const db = await getDatabase();
+  const entry = await db.prepare("SELECT * FROM waitlist WHERE id = ?").get(waitlistId) as unknown as DbWaitlist | undefined;
 
   if (!entry) {
     return { success: false, error: "Waitlist entry not found." };
@@ -1722,20 +1787,20 @@ export function leaveWaitlist(
   }
 
   const now = new Date().toISOString();
-  db.prepare(`
+  await db.prepare(`
     UPDATE waitlist 
     SET status = 'cancelled', updatedAt = ?
     WHERE id = ?
   `).run(now, waitlistId);
 
   // Shift positions of remaining active waitlist members so positions remain continuous 1..N
-  db.prepare(`
+  await db.prepare(`
     UPDATE waitlist 
     SET position = position - 1, updatedAt = ?
     WHERE resourceId = ? AND status = 'active' AND position > ?
   `).run(now, entry.resourceId, entry.position);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: borrowerId,
     action: "WAITLIST_LEFT",
@@ -1748,32 +1813,32 @@ export function leaveWaitlist(
   return { success: true };
 }
 
-export function getWaitlistByBorrower(borrowerId: string): DbWaitlist[] {
-  const db = getDatabase();
-  return db.prepare(`
+export async function getWaitlistByBorrower(borrowerId: string): Promise<DbWaitlist[]> {
+  const db = await getDatabase();
+  return await db.prepare(`
     SELECT * FROM waitlist 
     WHERE borrowerId = ? AND status = 'active'
     ORDER BY createdAt DESC
   `).all(borrowerId) as unknown as DbWaitlist[];
 }
 
-export function getWaitlistByResource(resourceId: string): DbWaitlist[] {
-  const db = getDatabase();
-  return db.prepare(`
+export async function getWaitlistByResource(resourceId: string): Promise<DbWaitlist[]> {
+  const db = await getDatabase();
+  return await db.prepare(`
     SELECT * FROM waitlist 
     WHERE resourceId = ? AND status = 'active'
     ORDER BY position ASC, createdAt ASC
   `).all(resourceId) as unknown as DbWaitlist[];
 }
 
-export function triggerWaitlistNotifications(
+export async function triggerWaitlistNotifications(
   resourceId: string, 
   freedStartDate: string, 
   freedEndDate: string,
   resourceTitle?: string
 ) {
-  const db = getDatabase();
-  const activeEntries = db.prepare(`
+  const db = await getDatabase();
+  const activeEntries = await db.prepare(`
     SELECT * FROM waitlist 
     WHERE resourceId = ? AND status = 'active'
     ORDER BY position ASC, createdAt ASC
@@ -1786,18 +1851,18 @@ export function triggerWaitlistNotifications(
     const overlapsFreed = entry.startDate <= freedEndDate && entry.endDate >= freedStartDate;
     if (overlapsFreed) {
       // Check if any other approved bookings block these dates
-      const conflict = db.prepare(`
+      const conflict = await db.prepare(`
         SELECT COUNT(*) as count FROM bookings 
         WHERE resourceId = ? AND status = 'approved' AND startDate <= ? AND endDate >= ?
       `).get(resourceId, entry.endDate, entry.startDate) as { count: number };
 
       if (conflict.count === 0) {
         // Mark as notified
-        db.prepare(`
+        await db.prepare(`
           UPDATE waitlist SET status = 'notified', updatedAt = ? WHERE id = ?
         `).run(now, entry.id);
 
-        createNotification({
+        await createNotification({
           userId: entry.borrowerId,
           title: `Availability Update for ${resourceTitle || "Reserved Resource"}!`,
           message: `A booking was cancelled! Requested dates ${entry.startDate} to ${entry.endDate} are currently available. Submit your booking request now to claim it.`,
@@ -1813,18 +1878,18 @@ export function triggerWaitlistNotifications(
 // PHASE 4: NOTIFICATIONS SYSTEM DAO METHODS
 // ==========================================
 
-export function createNotification(params: {
+export async function createNotification(params: {
   userId: string;
   title: string;
   message: string;
   type: NotificationType;
   relatedEntityId?: string;
-}): DbNotification {
-  const db = getDatabase();
+}): Promise<DbNotification> {
+  const db = await getDatabase();
   const now = new Date().toISOString();
   const notifId = `notif_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO notifications (id, userId, title, message, type, relatedEntityId, isRead, createdAt)
     VALUES (?, ?, ?, ?, ?, ?, 0, ?)
   `).run(
@@ -1837,12 +1902,12 @@ export function createNotification(params: {
     now
   );
 
-  return db.prepare("SELECT * FROM notifications WHERE id = ?").get(notifId) as unknown as DbNotification;
+  return await db.prepare("SELECT * FROM notifications WHERE id = ?").get(notifId) as unknown as DbNotification;
 }
 
-export function getUserNotifications(userId: string, limit = 20): DbNotification[] {
-  const db = getDatabase();
-  return db.prepare(`
+export async function getUserNotifications(userId: string, limit = 20): Promise<DbNotification[]> {
+  const db = await getDatabase();
+  return await db.prepare(`
     SELECT * FROM notifications 
     WHERE userId = ? 
     ORDER BY createdAt DESC 
@@ -1850,17 +1915,17 @@ export function getUserNotifications(userId: string, limit = 20): DbNotification
   `).all(userId, limit) as unknown as DbNotification[];
 }
 
-export function markNotificationAsRead(id: string, userId: string): boolean {
-  const db = getDatabase();
-  const res = db.prepare(`
+export async function markNotificationAsRead(id: string, userId: string): Promise<boolean> {
+  const db = await getDatabase();
+  const res = await db.prepare(`
     UPDATE notifications SET isRead = 1 WHERE id = ? AND userId = ?
   `).run(id, userId);
   return res.changes > 0;
 }
 
-export function markAllNotificationsAsRead(userId: string): boolean {
-  const db = getDatabase();
-  const res = db.prepare(`
+export async function markAllNotificationsAsRead(userId: string): Promise<boolean> {
+  const db = await getDatabase();
+  const res = await db.prepare(`
     UPDATE notifications SET isRead = 1 WHERE userId = ?
   `).run(userId);
   return res.changes > 0;
@@ -1870,19 +1935,19 @@ export function markAllNotificationsAsRead(userId: string): boolean {
 // PHASE 4: REAL PROFILE STATS DAO
 // ==========================================
 
-export function getUserStats(userId: string, role: string) {
-  const db = getDatabase();
+export async function getUserStats(userId: string, role: string) {
+  const db = await getDatabase();
 
   if (role === "owner") {
-    const incomingRequests = (db.prepare(`
+    const incomingRequests = (await db.prepare(`
       SELECT COUNT(*) as count FROM bookings WHERE ownerId = ? AND status = 'pending'
     `).get(userId) as { count: number }).count;
 
-    const approvedBookings = (db.prepare(`
+    const approvedBookings = (await db.prepare(`
       SELECT COUNT(*) as count FROM bookings WHERE ownerId = ? AND status = 'approved'
     `).get(userId) as { count: number }).count;
 
-    const completedLendings = (db.prepare(`
+    const completedLendings = (await db.prepare(`
       SELECT COUNT(*) as count FROM bookings WHERE ownerId = ? AND status = 'completed'
     `).get(userId) as { count: number }).count;
 
@@ -1897,19 +1962,19 @@ export function getUserStats(userId: string, role: string) {
       completionRate: "100%",
     };
   } else {
-    const totalBookings = (db.prepare(`
+    const totalBookings = (await db.prepare(`
       SELECT COUNT(*) as count FROM bookings WHERE borrowerId = ?
     `).get(userId) as { count: number }).count;
 
-    const approvedBookings = (db.prepare(`
+    const approvedBookings = (await db.prepare(`
       SELECT COUNT(*) as count FROM bookings WHERE borrowerId = ? AND status = 'approved'
     `).get(userId) as { count: number }).count;
 
-    const completedBorrowings = (db.prepare(`
+    const completedBorrowings = (await db.prepare(`
       SELECT COUNT(*) as count FROM bookings WHERE borrowerId = ? AND status = 'completed'
     `).get(userId) as { count: number }).count;
 
-    const activeWaitlist = (db.prepare(`
+    const activeWaitlist = (await db.prepare(`
       SELECT COUNT(*) as count FROM waitlist WHERE borrowerId = ? AND status = 'active'
     `).get(userId) as { count: number }).count;
 
@@ -1989,7 +2054,7 @@ export function parseDbResource(row: any): ParsedResource {
   };
 }
 
-export function createResource(params: {
+export async function createResource(params: {
   ownerId: string;
   title: string;
   tagline?: string;
@@ -2007,14 +2072,14 @@ export function createResource(params: {
   pickupInstructions?: string;
   safetyInstructions?: string;
   tags?: string[];
-}): ParsedResource {
-  const db = getDatabase();
+}): Promise<ParsedResource> {
+  const db = await getDatabase();
   const id = `res_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const now = new Date().toISOString();
-  const autoApprove = getPlatformSettingValue("auto_approve_listings", "true") === "true";
+  const autoApprove = await getPlatformSettingValue("auto_approve_listings", "true") === "true";
   const moderationStatus: ModerationStatus = autoApprove ? "approved" : "pending";
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO resources (
       id, ownerId, title, tagline, description, longDescription, category,
       images, condition, location, specs, borrowingTerms, eligibility,
@@ -2050,7 +2115,7 @@ export function createResource(params: {
     now
   );
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: params.ownerId,
     action: "RESOURCE_CREATED",
@@ -2060,10 +2125,10 @@ export function createResource(params: {
     timestamp: now,
   });
 
-  return getDbResourceById(id)!;
+  return (await getDbResourceById(id))!;
 }
 
-export function updateResource(
+export async function updateResource(
   id: string,
   ownerId: string,
   updates: Partial<{
@@ -2084,9 +2149,9 @@ export function updateResource(
     availabilityStatus: "Available" | "In Use" | "Waitlist" | "Paused" | "Maintenance";
     status: "active" | "paused" | "deleted";
   }>
-): { success: boolean; resource?: ParsedResource; error?: string } {
-  const db = getDatabase();
-  const existing = getDbResourceById(id);
+): Promise<{ success: boolean; resource?: ParsedResource; error?: string }> {
+  const db = await getDatabase();
+  const existing = await getDbResourceById(id);
 
   if (!existing) {
     return { success: false, error: "Resource not found." };
@@ -2114,7 +2179,7 @@ export function updateResource(
   const availabilityStatus = updates.availabilityStatus !== undefined ? updates.availabilityStatus : existing.availabilityStatus;
   const status = updates.status !== undefined ? updates.status : existing.status;
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE resources
     SET title = ?, tagline = ?, description = ?, longDescription = ?, category = ?,
         images = ?, condition = ?, location = ?, specs = ?, borrowingTerms = ?,
@@ -2128,7 +2193,7 @@ export function updateResource(
     availabilityStatus, status, now, id
   );
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: ownerId,
     action: "RESOURCE_UPDATED",
@@ -2138,15 +2203,15 @@ export function updateResource(
     timestamp: now,
   });
 
-  return { success: true, resource: getDbResourceById(id)! };
+  return { success: true, resource: (await getDbResourceById(id)) || undefined };
 }
 
-export function deleteResource(
+export async function deleteResource(
   id: string,
   ownerId: string
-): { success: boolean; error?: string } {
-  const db = getDatabase();
-  const existing = getDbResourceById(id);
+): Promise<{ success: boolean; error?: string }> {
+  const db = await getDatabase();
+  const existing = await getDbResourceById(id);
 
   if (!existing) {
     return { success: false, error: "Resource not found." };
@@ -2158,7 +2223,7 @@ export function deleteResource(
 
   // Prevent removal if active approved bookings exist!
   const today = new Date().toISOString().split("T")[0];
-  const activeBookings = db.prepare(`
+  const activeBookings = await db.prepare(`
     SELECT COUNT(*) as count FROM bookings 
     WHERE resourceId = ? AND status = 'approved' AND endDate >= ?
   `).get(id, today) as { count: number };
@@ -2171,13 +2236,13 @@ export function deleteResource(
   }
 
   const now = new Date().toISOString();
-  db.prepare(`
+  await db.prepare(`
     UPDATE resources 
     SET status = 'deleted', availabilityStatus = 'Paused', updatedAt = ?
     WHERE id = ?
   `).run(now, id);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: ownerId,
     action: "RESOURCE_DELETED",
@@ -2190,9 +2255,9 @@ export function deleteResource(
   return { success: true };
 }
 
-export function getDbResourceById(id: string): ParsedResource | null {
-  const db = getDatabase();
-  const row = db.prepare(`
+export async function getDbResourceById(id: string): Promise<ParsedResource | null> {
+  const db = await getDatabase();
+  const row = await db.prepare(`
     SELECT 
       r.*,
       u.fullName as ownerName,
@@ -2210,7 +2275,7 @@ export function getDbResourceById(id: string): ParsedResource | null {
   return parseDbResource(row);
 }
 
-export function getAllDbResources(filters?: {
+export async function getAllDbResources(filters?: {
   category?: string;
   condition?: string;
   availabilityStatus?: string;
@@ -2219,8 +2284,8 @@ export function getAllDbResources(filters?: {
   status?: string;
   moderationStatus?: string;
   publicOnly?: boolean;
-}): ParsedResource[] {
-  const db = getDatabase();
+}): Promise<ParsedResource[]> {
+  const db = await getDatabase();
   let query = `
     SELECT 
       r.*,
@@ -2282,13 +2347,13 @@ export function getAllDbResources(filters?: {
 
   query += " ORDER BY r.createdAt DESC";
 
-  const rows = db.prepare(query).all(...params);
+  const rows = await db.prepare(query).all(...params);
   return rows.map((r) => parseDbResource(r));
 }
 
-export function getDbResourcesByOwner(ownerId: string): ParsedResource[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getDbResourcesByOwner(ownerId: string): Promise<ParsedResource[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT 
       r.*,
       u.fullName as ownerName,
@@ -2308,18 +2373,18 @@ export function getDbResourcesByOwner(ownerId: string): ParsedResource[] {
 // PHASE 5: SAVED RESOURCES / WISHLIST DAO
 // ==========================================
 
-export function saveResource(
+export async function saveResource(
   userId: string,
   resourceId: string
-): { success: boolean; error?: string } {
-  const db = getDatabase();
-  const res = getDbResourceById(resourceId);
+): Promise<{ success: boolean; error?: string }> {
+  const db = await getDatabase();
+  const res = await getDbResourceById(resourceId);
 
   if (!res) {
     return { success: false, error: "Resource not found." };
   }
 
-  const existing = db.prepare(`
+  const existing = await db.prepare(`
     SELECT id FROM saved_resources WHERE userId = ? AND resourceId = ?
   `).get(userId, resourceId);
 
@@ -2330,12 +2395,12 @@ export function saveResource(
   const id = `sav_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const now = new Date().toISOString();
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO saved_resources (id, userId, resourceId, createdAt)
     VALUES (?, ?, ?, ?)
   `).run(id, userId, resourceId, now);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: userId,
     action: "RESOURCE_SAVED",
@@ -2348,17 +2413,17 @@ export function saveResource(
   return { success: true };
 }
 
-export function unsaveResource(
+export async function unsaveResource(
   userId: string,
   resourceIdOrSavedId: string
-): { success: boolean } {
-  const db = getDatabase();
-  db.prepare(`
+): Promise<{ success: boolean }> {
+  const db = await getDatabase();
+  await db.prepare(`
     DELETE FROM saved_resources 
     WHERE userId = ? AND (resourceId = ? OR id = ?)
   `).run(userId, resourceIdOrSavedId, resourceIdOrSavedId);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: userId,
     action: "RESOURCE_UNSAVED",
@@ -2371,9 +2436,9 @@ export function unsaveResource(
   return { success: true };
 }
 
-export function getSavedResources(userId: string): SavedResourceWithDetails[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getSavedResources(userId: string): Promise<SavedResourceWithDetails[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT 
       sr.id,
       sr.userId,
@@ -2418,9 +2483,9 @@ export function getSavedResources(userId: string): SavedResourceWithDetails[] {
   });
 }
 
-export function isResourceSaved(userId: string, resourceId: string): boolean {
-  const db = getDatabase();
-  const row = db.prepare(`
+export async function isResourceSaved(userId: string, resourceId: string): Promise<boolean> {
+  const db = await getDatabase();
+  const row = await db.prepare(`
     SELECT COUNT(*) as count FROM saved_resources 
     WHERE userId = ? AND resourceId = ?
   `).get(userId, resourceId) as { count: number };
@@ -2431,14 +2496,14 @@ export function isResourceSaved(userId: string, resourceId: string): boolean {
 // PHASE 5: COMMUNITY REVIEWS & RATINGS DAO
 // ==========================================
 
-export function createReview(params: {
+export async function createReview(params: {
   bookingId: string;
   reviewerId: string;
   rating: number;
   comment: string;
-}): { success: boolean; review?: DbReview; error?: string } {
-  const db = getDatabase();
-  const booking = getBookingById(params.bookingId);
+}): Promise<{ success: boolean; review?: DbReview; error?: string }> {
+  const db = await getDatabase();
+  const booking = await getBookingById(params.bookingId);
 
   if (!booking) {
     return { success: false, error: "Booking record not found." };
@@ -2468,7 +2533,7 @@ export function createReview(params: {
   }
 
   // Prevent duplicate reviews from the same reviewer for this booking
-  const existing = db.prepare(`
+  const existing = await db.prepare(`
     SELECT id FROM reviews WHERE bookingId = ? AND reviewerId = ?
   `).get(params.bookingId, params.reviewerId);
 
@@ -2479,7 +2544,7 @@ export function createReview(params: {
   const id = `rev_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const now = new Date().toISOString();
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO reviews (id, bookingId, reviewerId, revieweeId, resourceId, rating, comment, createdAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
@@ -2494,7 +2559,7 @@ export function createReview(params: {
     now
   );
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: params.reviewerId,
     action: "REVIEW_CREATED",
@@ -2504,8 +2569,8 @@ export function createReview(params: {
     timestamp: now,
   });
 
-  const reviewerUser = findUserById(params.reviewerId);
-  createNotification({
+  const reviewerUser = await findUserById(params.reviewerId);
+  await createNotification({
     userId: revieweeId,
     title: "New Review Received",
     message: `${reviewerUser?.fullName || "A peer member"} gave you a ${params.rating}-star review for equipment sharing.`,
@@ -2513,17 +2578,17 @@ export function createReview(params: {
     relatedEntityId: id,
   });
 
-  const created = db.prepare("SELECT * FROM reviews WHERE id = ?").get(id) as unknown as DbReview;
+  const created = await db.prepare("SELECT * FROM reviews WHERE id = ?").get(id) as unknown as DbReview;
   return { success: true, review: created };
 }
 
-export function updateReview(
+export async function updateReview(
   reviewId: string,
   reviewerId: string,
   updates: { rating?: number; comment?: string }
-): { success: boolean; review?: DbReview; error?: string } {
-  const db = getDatabase();
-  const existing = db.prepare("SELECT * FROM reviews WHERE id = ?").get(reviewId) as unknown as DbReview | undefined;
+): Promise<{ success: boolean; review?: DbReview; error?: string }> {
+  const db = await getDatabase();
+  const existing = await db.prepare("SELECT * FROM reviews WHERE id = ?").get(reviewId) as unknown as DbReview | undefined;
 
   if (!existing) {
     return { success: false, error: "Review not found." };
@@ -2537,13 +2602,13 @@ export function updateReview(
   const comment = updates.comment !== undefined ? updates.comment.trim() : existing.comment;
   const now = new Date().toISOString();
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE reviews 
     SET rating = ?, comment = ?, updatedAt = ?
     WHERE id = ?
   `).run(rating, comment, now, reviewId);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: reviewerId,
     action: "REVIEW_UPDATED",
@@ -2553,13 +2618,13 @@ export function updateReview(
     timestamp: now,
   });
 
-  const updated = db.prepare("SELECT * FROM reviews WHERE id = ?").get(reviewId) as unknown as DbReview;
+  const updated = await db.prepare("SELECT * FROM reviews WHERE id = ?").get(reviewId) as unknown as DbReview;
   return { success: true, review: updated };
 }
 
-export function getReviewsForResource(resourceId: string): DbReviewWithDetails[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getReviewsForResource(resourceId: string): Promise<DbReviewWithDetails[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT 
       rv.*,
       u.fullName as reviewerName,
@@ -2573,9 +2638,9 @@ export function getReviewsForResource(resourceId: string): DbReviewWithDetails[]
   return rows || [];
 }
 
-export function getReviewsForUser(userId: string): DbReviewWithDetails[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getReviewsForUser(userId: string): Promise<DbReviewWithDetails[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT 
       rv.*,
       u.fullName as reviewerName,
@@ -2591,9 +2656,9 @@ export function getReviewsForUser(userId: string): DbReviewWithDetails[] {
   return rows || [];
 }
 
-export function getUserRatingSummary(userId: string): { count: number; avgRating: number } {
-  const db = getDatabase();
-  const row = db.prepare(`
+export async function getUserRatingSummary(userId: string): Promise<{ count: number; avgRating: number }> {
+  const db = await getDatabase();
+  const row = await db.prepare(`
     SELECT COUNT(*) as count, AVG(rating) as avgRating 
     FROM reviews WHERE revieweeId = ?
   `).get(userId) as { count: number; avgRating: number | null };
@@ -2608,34 +2673,34 @@ export function getUserRatingSummary(userId: string): { count: number; avgRating
 // PHASE 5: REAL ANALYTICS & DASHBOARD METRICS
 // ==========================================
 
-export function getOwnerAnalytics(ownerId: string) {
-  const db = getDatabase();
+export async function getOwnerAnalytics(ownerId: string) {
+  const db = await getDatabase();
 
-  const totalResources = (db.prepare(`
+  const totalResources = (await db.prepare(`
     SELECT COUNT(*) as count FROM resources WHERE ownerId = ? AND status != 'deleted'
   `).get(ownerId) as { count: number }).count;
 
-  const activeListings = (db.prepare(`
+  const activeListings = (await db.prepare(`
     SELECT COUNT(*) as count FROM resources WHERE ownerId = ? AND status = 'active'
   `).get(ownerId) as { count: number }).count;
 
-  const totalRequests = (db.prepare(`
+  const totalRequests = (await db.prepare(`
     SELECT COUNT(*) as count FROM bookings WHERE ownerId = ?
   `).get(ownerId) as { count: number }).count;
 
-  const approvedBookings = (db.prepare(`
+  const approvedBookings = (await db.prepare(`
     SELECT COUNT(*) as count FROM bookings WHERE ownerId = ? AND status = 'approved'
   `).get(ownerId) as { count: number }).count;
 
-  const completedLendings = (db.prepare(`
+  const completedLendings = (await db.prepare(`
     SELECT COUNT(*) as count FROM bookings WHERE ownerId = ? AND status = 'completed'
   `).get(ownerId) as { count: number }).count;
 
-  const rejectedCancelled = (db.prepare(`
+  const rejectedCancelled = (await db.prepare(`
     SELECT COUNT(*) as count FROM bookings WHERE ownerId = ? AND status IN ('rejected', 'cancelled')
   `).get(ownerId) as { count: number }).count;
 
-  const ratingSummary = getUserRatingSummary(ownerId);
+  const ratingSummary = await getUserRatingSummary(ownerId);
 
   // Utilization calculation
   const utilization = totalRequests > 0 
@@ -2643,7 +2708,7 @@ export function getOwnerAnalytics(ownerId: string) {
     : 0;
 
   // Most requested resources
-  const mostRequested = db.prepare(`
+  const mostRequested = await db.prepare(`
     SELECT 
       r.id,
       r.title,
@@ -2671,33 +2736,33 @@ export function getOwnerAnalytics(ownerId: string) {
   };
 }
 
-export function getBorrowerAnalytics(borrowerId: string) {
-  const db = getDatabase();
+export async function getBorrowerAnalytics(borrowerId: string) {
+  const db = await getDatabase();
 
-  const totalRequests = (db.prepare(`
+  const totalRequests = (await db.prepare(`
     SELECT COUNT(*) as count FROM bookings WHERE borrowerId = ?
   `).get(borrowerId) as { count: number }).count;
 
-  const approvedBookings = (db.prepare(`
+  const approvedBookings = (await db.prepare(`
     SELECT COUNT(*) as count FROM bookings WHERE borrowerId = ? AND status = 'approved'
   `).get(borrowerId) as { count: number }).count;
 
-  const completedBorrowings = (db.prepare(`
+  const completedBorrowings = (await db.prepare(`
     SELECT COUNT(*) as count FROM bookings WHERE borrowerId = ? AND status = 'completed'
   `).get(borrowerId) as { count: number }).count;
 
-  const activeWaitlist = (db.prepare(`
+  const activeWaitlist = (await db.prepare(`
     SELECT COUNT(*) as count FROM waitlist WHERE borrowerId = ? AND status = 'active'
   `).get(borrowerId) as { count: number }).count;
 
-  const savedCount = (db.prepare(`
+  const savedCount = (await db.prepare(`
     SELECT COUNT(*) as count FROM saved_resources WHERE userId = ?
   `).get(borrowerId) as { count: number }).count;
 
-  const ratingSummary = getUserRatingSummary(borrowerId);
+  const ratingSummary = await getUserRatingSummary(borrowerId);
 
   // Favorite categories
-  const categories = db.prepare(`
+  const categories = await db.prepare(`
     SELECT 
       r.category,
       COUNT(b.id) as borrowCount
@@ -2725,12 +2790,12 @@ export function getBorrowerAnalytics(borrowerId: string) {
 // PHASE 5: REAL TRUST & REPUTATION BADGES
 // ==========================================
 
-export function getUserTrustProfile(userId: string) {
-  const db = getDatabase();
-  const user = findUserById(userId);
+export async function getUserTrustProfile(userId: string) {
+  const db = await getDatabase();
+  const user = await findUserById(userId);
   if (!user) return null;
 
-  const ratings = getUserRatingSummary(userId);
+  const ratings = await getUserRatingSummary(userId);
   const now = new Date().toISOString();
 
   const badges: {
@@ -2754,7 +2819,7 @@ export function getUserTrustProfile(userId: string) {
 
   // 2. Borrower-earned badges
   if (user.role === "borrower" || user.role === "admin") {
-    const completedCount = (db.prepare(`
+    const completedCount = (await db.prepare(`
       SELECT COUNT(*) as count FROM bookings WHERE borrowerId = ? AND status = 'completed'
     `).get(userId) as { count: number }).count;
 
@@ -2781,11 +2846,11 @@ export function getUserTrustProfile(userId: string) {
 
   // 3. Owner-earned badges
   if (user.role === "owner" || user.role === "admin") {
-    const activeResources = (db.prepare(`
+    const activeResources = (await db.prepare(`
       SELECT COUNT(*) as count FROM resources WHERE ownerId = ? AND status = 'active'
     `).get(userId) as { count: number }).count;
 
-    const completedLendings = (db.prepare(`
+    const completedLendings = (await db.prepare(`
       SELECT COUNT(*) as count FROM bookings WHERE ownerId = ? AND status = 'completed'
     `).get(userId) as { count: number }).count;
 
@@ -2838,10 +2903,10 @@ export function getUserTrustProfile(userId: string) {
 // =====================================================================
 
 // 1. Admin Dashboard Overview Metrics
-export function getAdminDashboardMetrics(): AdminDashboardMetrics {
-  const db = getDatabase();
+export async function getAdminDashboardMetrics(): Promise<AdminDashboardMetrics> {
+  const db = await getDatabase();
 
-  const userStats = db.prepare(`
+  const userStats = await db.prepare(`
     SELECT 
       COUNT(*) as totalUsers,
       SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as activeUsers,
@@ -2849,7 +2914,7 @@ export function getAdminDashboardMetrics(): AdminDashboardMetrics {
     FROM users;
   `).get() as { totalUsers: number; activeUsers: number; suspendedUsers: number };
 
-  const resourceStats = db.prepare(`
+  const resourceStats = await db.prepare(`
     SELECT 
       COUNT(*) as totalResources,
       SUM(CASE WHEN moderationStatus = 'pending' THEN 1 ELSE 0 END) as pendingReviewResources,
@@ -2859,19 +2924,19 @@ export function getAdminDashboardMetrics(): AdminDashboardMetrics {
     WHERE status != 'deleted';
   `).get() as { totalResources: number; pendingReviewResources: number; approvedResources: number; suspendedResources: number };
 
-  const totalBookings = (db.prepare(`SELECT COUNT(*) as count FROM bookings;`).get() as { count: number }).count;
+  const totalBookings = (await db.prepare(`SELECT COUNT(*) as count FROM bookings;`).get() as { count: number }).count;
 
-  const activeDisputes = (db.prepare(`
+  const activeDisputes = (await db.prepare(`
     SELECT COUNT(*) as count FROM booking_disputes WHERE status IN ('open', 'under_review');
   `).get() as { count: number }).count;
 
-  const openReports = (db.prepare(`
+  const openReports = (await db.prepare(`
     SELECT COUNT(*) as count FROM user_reports WHERE status IN ('open', 'investigating');
   `).get() as { count: number }).count;
 
-  const categoriesCount = (db.prepare(`SELECT COUNT(*) as count FROM platform_categories;`).get() as { count: number }).count;
+  const categoriesCount = (await db.prepare(`SELECT COUNT(*) as count FROM platform_categories;`).get() as { count: number }).count;
 
-  const categoryDistribution = db.prepare(`
+  const categoryDistribution = await db.prepare(`
     SELECT category, COUNT(*) as count 
     FROM resources 
     WHERE status != 'deleted' 
@@ -2879,19 +2944,19 @@ export function getAdminDashboardMetrics(): AdminDashboardMetrics {
     ORDER BY count DESC;
   `).all() as unknown as { category: string; count: number }[];
 
-  const userRoleDistribution = db.prepare(`
+  const userRoleDistribution = await db.prepare(`
     SELECT role, COUNT(*) as count 
     FROM users 
     GROUP BY role;
   `).all() as unknown as { role: string; count: number }[];
 
-  const bookingStatusDistribution = db.prepare(`
+  const bookingStatusDistribution = await db.prepare(`
     SELECT status, COUNT(*) as count 
     FROM bookings 
     GROUP BY status;
   `).all() as unknown as { status: string; count: number }[];
 
-  const recentAuditLogs = db.prepare(`
+  const recentAuditLogs = await db.prepare(`
     SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT 10;
   `).all() as unknown as DbAuditLog[];
 
@@ -2915,12 +2980,12 @@ export function getAdminDashboardMetrics(): AdminDashboardMetrics {
 }
 
 // 2. Admin User Management
-export function getAllUsersForAdmin(filters?: {
+export async function getAllUsersForAdmin(filters?: {
   role?: string;
   status?: string;
   search?: string;
-}): DbUser[] {
-  const db = getDatabase();
+}): Promise<DbUser[]> {
+  const db = await getDatabase();
   let query = "SELECT * FROM users WHERE 1=1";
   const params: any[] = [];
 
@@ -2941,10 +3006,10 @@ export function getAllUsersForAdmin(filters?: {
   }
 
   query += " ORDER BY createdAt DESC";
-  return db.prepare(query).all(...params) as unknown as DbUser[];
+  return await db.prepare(query).all(...params) as unknown as DbUser[];
 }
 
-export function getUserDetailsForAdmin(userId: string): {
+export async function getUserDetailsForAdmin(userId: string): Promise<{
   user: DbUser | null;
   stats: {
     bookingsAsBorrower: number;
@@ -2955,9 +3020,9 @@ export function getUserDetailsForAdmin(userId: string): {
     reportsFiled: number;
   };
   auditLogs: DbAuditLog[];
-} {
-  const db = getDatabase();
-  const user = findUserById(userId);
+}> {
+  const db = await getDatabase();
+  const user = await findUserById(userId);
   if (!user) {
     return {
       user: null,
@@ -2966,14 +3031,14 @@ export function getUserDetailsForAdmin(userId: string): {
     };
   }
 
-  const bookingsAsBorrower = (db.prepare(`SELECT COUNT(*) as c FROM bookings WHERE borrowerId = ?`).get(userId) as { c: number }).c;
-  const resourcesOwned = (db.prepare(`SELECT COUNT(*) as c FROM resources WHERE ownerId = ? AND status != 'deleted'`).get(userId) as { c: number }).c;
-  const bookingsReceived = (db.prepare(`SELECT COUNT(*) as c FROM bookings WHERE ownerId = ?`).get(userId) as { c: number }).c;
-  const disputesInvolved = (db.prepare(`SELECT COUNT(*) as c FROM booking_disputes WHERE initiatorId = ? OR respondentId = ?`).get(userId, userId) as { c: number }).c;
-  const reportsAgainst = (db.prepare(`SELECT COUNT(*) as c FROM user_reports WHERE targetType = 'user' AND targetId = ?`).get(userId) as { c: number }).c;
-  const reportsFiled = (db.prepare(`SELECT COUNT(*) as c FROM user_reports WHERE reporterId = ?`).get(userId) as { c: number }).c;
+  const bookingsAsBorrower = (await db.prepare(`SELECT COUNT(*) as c FROM bookings WHERE borrowerId = ?`).get(userId) as { c: number }).c;
+  const resourcesOwned = (await db.prepare(`SELECT COUNT(*) as c FROM resources WHERE ownerId = ? AND status != 'deleted'`).get(userId) as { c: number }).c;
+  const bookingsReceived = (await db.prepare(`SELECT COUNT(*) as c FROM bookings WHERE ownerId = ?`).get(userId) as { c: number }).c;
+  const disputesInvolved = (await db.prepare(`SELECT COUNT(*) as c FROM booking_disputes WHERE initiatorId = ? OR respondentId = ?`).get(userId, userId) as { c: number }).c;
+  const reportsAgainst = (await db.prepare(`SELECT COUNT(*) as c FROM user_reports WHERE targetType = 'user' AND targetId = ?`).get(userId) as { c: number }).c;
+  const reportsFiled = (await db.prepare(`SELECT COUNT(*) as c FROM user_reports WHERE reporterId = ?`).get(userId) as { c: number }).c;
 
-  const auditLogs = db.prepare(`SELECT * FROM audit_logs WHERE actorId = ? ORDER BY timestamp DESC LIMIT 15`).all(userId) as unknown as DbAuditLog[];
+  const auditLogs = await db.prepare(`SELECT * FROM audit_logs WHERE actorId = ? ORDER BY timestamp DESC LIMIT 15`).all(userId) as unknown as DbAuditLog[];
 
   return {
     user,
@@ -2989,14 +3054,14 @@ export function getUserDetailsForAdmin(userId: string): {
   };
 }
 
-export function updateUserStatusByAdmin(
+export async function updateUserStatusByAdmin(
   adminId: string,
   targetUserId: string,
   newStatus: "active" | "suspended",
   reason?: string
-): { success: boolean; user?: DbUser; error?: string } {
-  const db = getDatabase();
-  const target = findUserById(targetUserId);
+): Promise<{ success: boolean; user?: DbUser; error?: string }> {
+  const db = await getDatabase();
+  const target = await findUserById(targetUserId);
   if (!target) {
     return { success: false, error: "Target user not found." };
   }
@@ -3008,7 +3073,7 @@ export function updateUserStatusByAdmin(
 
   // Last active admin protection
   if (target.role === "admin" && newStatus === "suspended") {
-    const activeAdminsCount = (db.prepare(`
+    const activeAdminsCount = (await db.prepare(`
       SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND status = 'active'
     `).get() as { count: number }).count;
 
@@ -3022,13 +3087,13 @@ export function updateUserStatusByAdmin(
   const suspendedAt = newStatus === "suspended" ? now : null;
   const suspendedBy = newStatus === "suspended" ? adminId : null;
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE users 
     SET status = ?, suspendedReason = ?, suspendedAt = ?, suspendedBy = ?, updatedAt = ?
     WHERE id = ?
   `).run(newStatus, suspendedReason, suspendedAt, suspendedBy, now, targetUserId);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: adminId,
     action: newStatus === "suspended" ? "USER_SUSPENDED" : "USER_ACTIVATED",
@@ -3038,7 +3103,7 @@ export function updateUserStatusByAdmin(
     timestamp: now,
   });
 
-  createNotification({
+  await createNotification({
     userId: targetUserId,
     title: newStatus === "suspended" ? "Account Suspended" : "Account Reactivated",
     message: newStatus === "suspended" 
@@ -3048,16 +3113,16 @@ export function updateUserStatusByAdmin(
     relatedEntityId: targetUserId,
   });
 
-  return { success: true, user: findUserById(targetUserId)! };
+  return { success: true, user: (await findUserById(targetUserId)) || undefined };
 }
 
-export function updateUserRoleByAdmin(
+export async function updateUserRoleByAdmin(
   adminId: string,
   targetUserId: string,
   newRole: "borrower" | "owner" | "admin"
-): { success: boolean; user?: DbUser; error?: string } {
-  const db = getDatabase();
-  const target = findUserById(targetUserId);
+): Promise<{ success: boolean; user?: DbUser; error?: string }> {
+  const db = await getDatabase();
+  const target = await findUserById(targetUserId);
   if (!target) {
     return { success: false, error: "Target user not found." };
   }
@@ -3068,7 +3133,7 @@ export function updateUserRoleByAdmin(
 
   // Safeguard: Last active admin cannot be demoted
   if (target.role === "admin" && newRole !== "admin") {
-    const activeAdminsCount = (db.prepare(`
+    const activeAdminsCount = (await db.prepare(`
       SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND status = 'active'
     `).get() as { count: number }).count;
 
@@ -3078,13 +3143,13 @@ export function updateUserRoleByAdmin(
   }
 
   const now = new Date().toISOString();
-  db.prepare(`
+  await db.prepare(`
     UPDATE users 
     SET role = ?, updatedAt = ?
     WHERE id = ?
   `).run(newRole, now, targetUserId);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: adminId,
     action: "USER_ROLE_CHANGED",
@@ -3094,7 +3159,7 @@ export function updateUserRoleByAdmin(
     timestamp: now,
   });
 
-  createNotification({
+  await createNotification({
     userId: targetUserId,
     title: "Account Role Updated",
     message: `Your account role on ResourceX has been changed from ${target.role} to ${newRole}.`,
@@ -3102,16 +3167,16 @@ export function updateUserRoleByAdmin(
     relatedEntityId: targetUserId,
   });
 
-  return { success: true, user: findUserById(targetUserId)! };
+  return { success: true, user: (await findUserById(targetUserId)) || undefined };
 }
 
 // 3. Resource Moderation
-export function getAllResourcesForAdmin(filters?: {
+export async function getAllResourcesForAdmin(filters?: {
   moderationStatus?: string;
   category?: string;
   search?: string;
-}): ParsedResource[] {
-  const db = getDatabase();
+}): Promise<ParsedResource[]> {
+  const db = await getDatabase();
   let query = `
     SELECT 
       r.*,
@@ -3144,18 +3209,18 @@ export function getAllResourcesForAdmin(filters?: {
   }
 
   query += " ORDER BY r.createdAt DESC";
-  const rows = db.prepare(query).all(...params);
+  const rows = await db.prepare(query).all(...params);
   return rows.map((r) => parseDbResource(r));
 }
 
-export function moderateResourceByAdmin(
+export async function moderateResourceByAdmin(
   adminId: string,
   resourceId: string,
   action: "approve" | "reject" | "suspend" | "restore",
   reason?: string
-): { success: boolean; resource?: ParsedResource; error?: string } {
-  const db = getDatabase();
-  const existing = getDbResourceById(resourceId);
+): Promise<{ success: boolean; resource?: ParsedResource; error?: string }> {
+  const db = await getDatabase();
+  const existing = await getDbResourceById(resourceId);
   if (!existing) {
     return { success: false, error: "Resource not found." };
   }
@@ -3186,7 +3251,7 @@ export function moderateResourceByAdmin(
 
   // Insert moderation history
   const historyId = `mod_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO resource_moderation_history (id, resourceId, adminId, previousStatus, newStatus, reason, createdAt)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
@@ -3200,13 +3265,13 @@ export function moderateResourceByAdmin(
   );
 
   // Update resource
-  db.prepare(`
+  await db.prepare(`
     UPDATE resources 
     SET moderationStatus = ?, moderationReason = ?, moderatedBy = ?, moderatedAt = ?, updatedAt = ?
     WHERE id = ?
   `).run(newModerationStatus, trimmedReason, adminId, now, now, resourceId);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: adminId,
     action: auditAction,
@@ -3236,7 +3301,7 @@ export function moderateResourceByAdmin(
     notifMsg = `Your resource listing "${existing.title}" has been restored to active status on the catalog.`;
   }
 
-  createNotification({
+  await createNotification({
     userId: existing.ownerId,
     title: notifTitle,
     message: notifMsg,
@@ -3244,15 +3309,15 @@ export function moderateResourceByAdmin(
     relatedEntityId: resourceId,
   });
 
-  return { success: true, resource: getDbResourceById(resourceId)! };
+  return { success: true, resource: (await getDbResourceById(resourceId)) || undefined };
 }
 
 // 4. Bookings & Dispute Management
-export function getAllBookingsForAdmin(filters?: {
+export async function getAllBookingsForAdmin(filters?: {
   status?: string;
   search?: string;
-}): DbBookingWithDetails[] {
-  const db = getDatabase();
+}): Promise<DbBookingWithDetails[]> {
+  const db = await getDatabase();
   let query = `
     SELECT 
       b.*,
@@ -3282,18 +3347,18 @@ export function getAllBookingsForAdmin(filters?: {
   }
 
   query += " ORDER BY b.createdAt DESC";
-  return db.prepare(query).all(...params) as unknown as DbBookingWithDetails[];
+  return await db.prepare(query).all(...params) as unknown as DbBookingWithDetails[];
 }
 
-export function createDispute(params: {
+export async function createDispute(params: {
   bookingId: string;
   initiatorId: string;
   reason: string;
   description: string;
   evidence?: string[];
-}): { success: boolean; dispute?: DbDispute; error?: string } {
-  const db = getDatabase();
-  const booking = getBookingById(params.bookingId);
+}): Promise<{ success: boolean; dispute?: DbDispute; error?: string }> {
+  const db = await getDatabase();
+  const booking = await getBookingById(params.bookingId);
   if (!booking) {
     return { success: false, error: "Booking not found." };
   }
@@ -3302,7 +3367,7 @@ export function createDispute(params: {
     return { success: false, error: "Only the borrower or owner of this booking can raise a dispute." };
   }
 
-  const existingActive = db.prepare(`
+  const existingActive = await db.prepare(`
     SELECT id FROM booking_disputes 
     WHERE bookingId = ? AND status IN ('open', 'under_review')
   `).get(params.bookingId);
@@ -3315,7 +3380,7 @@ export function createDispute(params: {
   const disputeId = `dsp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const now = new Date().toISOString();
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO booking_disputes (
       id, bookingId, initiatorId, respondentId, reason, description, evidence, status, createdAt, updatedAt
     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
@@ -3331,7 +3396,7 @@ export function createDispute(params: {
     now
   );
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: params.initiatorId,
     action: "DISPUTE_OPENED",
@@ -3341,7 +3406,7 @@ export function createDispute(params: {
     timestamp: now,
   });
 
-  createNotification({
+  await createNotification({
     userId: respondentId,
     title: "Dispute Opened on Booking",
     message: `A dispute has been raised regarding booking #${params.bookingId.slice(0, 8)}. Reason: ${params.reason}. Platform administrators will review the case.`,
@@ -3349,7 +3414,7 @@ export function createDispute(params: {
     relatedEntityId: disputeId,
   });
 
-  createNotification({
+  await createNotification({
     userId: params.initiatorId,
     title: "Dispute Submitted",
     message: `Your dispute for booking #${params.bookingId.slice(0, 8)} has been submitted. Case ID: ${disputeId}.`,
@@ -3357,12 +3422,12 @@ export function createDispute(params: {
     relatedEntityId: disputeId,
   });
 
-  const created = db.prepare("SELECT * FROM booking_disputes WHERE id = ?").get(disputeId) as unknown as DbDispute;
+  const created = await db.prepare("SELECT * FROM booking_disputes WHERE id = ?").get(disputeId) as unknown as DbDispute;
   return { success: true, dispute: created };
 }
 
-export function getDisputesForAdmin(filters?: { status?: string }): DbDisputeWithDetails[] {
-  const db = getDatabase();
+export async function getDisputesForAdmin(filters?: { status?: string }): Promise<DbDisputeWithDetails[]> {
+  const db = await getDatabase();
   let query = `
     SELECT 
       d.*,
@@ -3389,12 +3454,12 @@ export function getDisputesForAdmin(filters?: { status?: string }): DbDisputeWit
   }
 
   query += " ORDER BY d.createdAt DESC";
-  return db.prepare(query).all(...params) as unknown as DbDisputeWithDetails[];
+  return await db.prepare(query).all(...params) as unknown as DbDisputeWithDetails[];
 }
 
-export function getDisputesForUser(userId: string): Omit<DbDisputeWithDetails, "adminNotes">[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getDisputesForUser(userId: string): Promise<Omit<DbDisputeWithDetails, "adminNotes">[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT 
       d.id, d.bookingId, d.initiatorId, d.respondentId, d.reason, d.description, d.evidence,
       d.status, d.resolution, d.actionTaken, d.resolvedAt, d.createdAt, d.updatedAt,
@@ -3414,9 +3479,9 @@ export function getDisputesForUser(userId: string): Omit<DbDisputeWithDetails, "
   return rows;
 }
 
-export function getDisputeById(id: string): DbDisputeWithDetails | null {
-  const db = getDatabase();
-  const row = db.prepare(`
+export async function getDisputeById(id: string): Promise<DbDisputeWithDetails | null> {
+  const db = await getDatabase();
+  const row = await db.prepare(`
     SELECT 
       d.*,
       b.resourceId as bookingResourceId,
@@ -3438,7 +3503,7 @@ export function getDisputeById(id: string): DbDisputeWithDetails | null {
   return row || null;
 }
 
-export function updateDisputeByAdmin(
+export async function updateDisputeByAdmin(
   adminId: string,
   disputeId: string,
   updates: {
@@ -3448,9 +3513,9 @@ export function updateDisputeByAdmin(
     resolution?: string;
     actionTaken?: string;
   }
-): { success: boolean; dispute?: DbDisputeWithDetails; error?: string } {
-  const db = getDatabase();
-  const existing = getDisputeById(disputeId);
+): Promise<{ success: boolean; dispute?: DbDisputeWithDetails; error?: string }> {
+  const db = await getDatabase();
+  const existing = await getDisputeById(disputeId);
   if (!existing) {
     return { success: false, error: "Dispute not found." };
   }
@@ -3463,13 +3528,13 @@ export function updateDisputeByAdmin(
   const actionTaken = (updates.actionTaken !== undefined ? updates.actionTaken : existing.actionTaken) ?? null;
   const resolvedAt = ((status === "resolved" || status === "closed" || status === "rejected") && !existing.resolvedAt ? now : existing.resolvedAt) ?? null;
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE booking_disputes 
     SET status = ?, assignedAdminId = ?, adminNotes = ?, resolution = ?, actionTaken = ?, resolvedAt = ?, updatedAt = ?
     WHERE id = ?
   `).run(status, assignedAdminId, adminNotes, resolution, actionTaken, resolvedAt, now, disputeId);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: adminId,
     action: status === "resolved" ? "DISPUTE_RESOLVED" : "DISPUTE_UPDATED",
@@ -3481,14 +3546,14 @@ export function updateDisputeByAdmin(
 
   if (status === "resolved" && resolution) {
     const notifyMsg = `Dispute #${disputeId.slice(0, 8)} has been marked as resolved by admin. Resolution: ${resolution}`;
-    createNotification({
+    await createNotification({
       userId: existing.initiatorId,
       title: "Dispute Resolved",
       message: notifyMsg,
       type: "system",
       relatedEntityId: disputeId,
     });
-    createNotification({
+    await createNotification({
       userId: existing.respondentId,
       title: "Dispute Resolved",
       message: notifyMsg,
@@ -3497,21 +3562,21 @@ export function updateDisputeByAdmin(
     });
   }
 
-  return { success: true, dispute: getDisputeById(disputeId)! };
+  return { success: true, dispute: (await getDisputeById(disputeId)) || undefined };
 }
 
 // 5. Reporting & Community Safety
-export function createReport(params: {
+export async function createReport(params: {
   reporterId: string;
   targetType: ReportTargetType;
   targetId: string;
   reason: string;
   details: string;
   evidence?: string[];
-}): { success: boolean; report?: DbReport; error?: string } {
-  const db = getDatabase();
+}): Promise<{ success: boolean; report?: DbReport; error?: string }> {
+  const db = await getDatabase();
 
-  const duplicate = db.prepare(`
+  const duplicate = await db.prepare(`
     SELECT id FROM user_reports 
     WHERE reporterId = ? AND targetType = ? AND targetId = ? AND status IN ('open', 'investigating')
   `).get(params.reporterId, params.targetType, params.targetId);
@@ -3521,20 +3586,20 @@ export function createReport(params: {
   }
 
   if (params.targetType === "user") {
-    const targetUser = findUserById(params.targetId);
+    const targetUser = await findUserById(params.targetId);
     if (!targetUser) return { success: false, error: "Target user not found." };
   } else if (params.targetType === "resource") {
-    const targetRes = getDbResourceById(params.targetId);
+    const targetRes = await getDbResourceById(params.targetId);
     if (!targetRes) return { success: false, error: "Target resource not found." };
   } else if (params.targetType === "booking") {
-    const targetBk = getBookingById(params.targetId);
+    const targetBk = await getBookingById(params.targetId);
     if (!targetBk) return { success: false, error: "Target booking not found." };
   }
 
   const reportId = `rep_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const now = new Date().toISOString();
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO user_reports (
       id, reporterId, targetType, targetId, reason, details, evidence, status, createdAt, updatedAt
     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
@@ -3550,7 +3615,7 @@ export function createReport(params: {
     now
   );
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: params.reporterId,
     action: "REPORT_SUBMITTED",
@@ -3560,7 +3625,7 @@ export function createReport(params: {
     timestamp: now,
   });
 
-  createNotification({
+  await createNotification({
     userId: params.reporterId,
     title: "Report Received",
     message: `Thank you for helping keep ResourceX safe. Your report (ID: ${reportId}) has been received and our safety team is reviewing it.`,
@@ -3568,15 +3633,15 @@ export function createReport(params: {
     relatedEntityId: reportId,
   });
 
-  const created = db.prepare("SELECT * FROM user_reports WHERE id = ?").get(reportId) as unknown as DbReport;
+  const created = await db.prepare("SELECT * FROM user_reports WHERE id = ?").get(reportId) as unknown as DbReport;
   return { success: true, report: created };
 }
 
-export function getReportsForAdmin(filters?: {
+export async function getReportsForAdmin(filters?: {
   status?: string;
   targetType?: string;
-}): DbReportWithDetails[] {
-  const db = getDatabase();
+}): Promise<DbReportWithDetails[]> {
+  const db = await getDatabase();
   let query = `
     SELECT 
       r.*,
@@ -3601,24 +3666,26 @@ export function getReportsForAdmin(filters?: {
   }
 
   query += " ORDER BY r.createdAt DESC";
-  const rows = db.prepare(query).all(...params) as unknown as DbReportWithDetails[];
+  const rows = await db.prepare(query).all(...params) as unknown as DbReportWithDetails[];
 
-  return rows.map((rep) => {
-    let targetTitleOrName = rep.targetId;
-    if (rep.targetType === "resource") {
-      const res = db.prepare("SELECT title FROM resources WHERE id = ?").get(rep.targetId) as { title: string } | undefined;
-      if (res) targetTitleOrName = res.title;
-    } else if (rep.targetType === "user") {
-      const u = db.prepare("SELECT fullName FROM users WHERE id = ?").get(rep.targetId) as { fullName: string } | undefined;
-      if (u) targetTitleOrName = u.fullName;
-    }
-    return { ...rep, targetTitleOrName };
-  });
+  return Promise.all(
+    rows.map(async (rep) => {
+      let targetTitleOrName = rep.targetId;
+      if (rep.targetType === "resource") {
+        const res = (await db.prepare("SELECT title FROM resources WHERE id = ?").get(rep.targetId)) as { title: string } | null;
+        if (res) targetTitleOrName = res.title;
+      } else if (rep.targetType === "user") {
+        const u = (await db.prepare("SELECT fullName FROM users WHERE id = ?").get(rep.targetId)) as { fullName: string } | null;
+        if (u) targetTitleOrName = u.fullName;
+      }
+      return { ...rep, targetTitleOrName };
+    })
+  );
 }
 
-export function getReportsForUser(userId: string): Omit<DbReportWithDetails, "adminNotes">[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getReportsForUser(userId: string): Promise<Omit<DbReportWithDetails, "adminNotes">[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT 
       r.id, r.reporterId, r.targetType, r.targetId, r.reason, r.details, r.evidence,
       r.status, r.resolution, r.actionTaken, r.resolvedAt, r.createdAt, r.updatedAt,
@@ -3629,22 +3696,24 @@ export function getReportsForUser(userId: string): Omit<DbReportWithDetails, "ad
     ORDER BY r.createdAt DESC
   `).all(userId) as unknown as Omit<DbReportWithDetails, "adminNotes">[];
 
-  return rows.map((rep) => {
-    let targetTitleOrName = rep.targetId;
-    if (rep.targetType === "resource") {
-      const res = db.prepare("SELECT title FROM resources WHERE id = ?").get(rep.targetId) as { title: string } | undefined;
-      if (res) targetTitleOrName = res.title;
-    } else if (rep.targetType === "user") {
-      const u = db.prepare("SELECT fullName FROM users WHERE id = ?").get(rep.targetId) as { fullName: string } | undefined;
-      if (u) targetTitleOrName = u.fullName;
-    }
-    return { ...rep, targetTitleOrName };
-  });
+  return Promise.all(
+    rows.map(async (rep) => {
+      let targetTitleOrName = rep.targetId;
+      if (rep.targetType === "resource") {
+        const res = (await db.prepare("SELECT title FROM resources WHERE id = ?").get(rep.targetId)) as { title: string } | null;
+        if (res) targetTitleOrName = res.title;
+      } else if (rep.targetType === "user") {
+        const u = (await db.prepare("SELECT fullName FROM users WHERE id = ?").get(rep.targetId)) as { fullName: string } | null;
+        if (u) targetTitleOrName = u.fullName;
+      }
+      return { ...rep, targetTitleOrName };
+    })
+  );
 }
 
-export function getReportById(id: string): DbReportWithDetails | null {
-  const db = getDatabase();
-  const rep = db.prepare(`
+export async function getReportById(id: string): Promise<DbReportWithDetails | null> {
+  const db = await getDatabase();
+  const rep = await db.prepare(`
     SELECT 
       r.*,
       u1.fullName as reporterName,
@@ -3660,17 +3729,17 @@ export function getReportById(id: string): DbReportWithDetails | null {
 
   let targetTitleOrName = rep.targetId;
   if (rep.targetType === "resource") {
-    const res = db.prepare("SELECT title FROM resources WHERE id = ?").get(rep.targetId) as { title: string } | undefined;
+    const res = await db.prepare("SELECT title FROM resources WHERE id = ?").get(rep.targetId) as { title: string } | undefined;
     if (res) targetTitleOrName = res.title;
   } else if (rep.targetType === "user") {
-    const u = db.prepare("SELECT fullName FROM users WHERE id = ?").get(rep.targetId) as { fullName: string } | undefined;
+    const u = await db.prepare("SELECT fullName FROM users WHERE id = ?").get(rep.targetId) as { fullName: string } | undefined;
     if (u) targetTitleOrName = u.fullName;
   }
 
   return { ...rep, targetTitleOrName };
 }
 
-export function updateReportByAdmin(
+export async function updateReportByAdmin(
   adminId: string,
   reportId: string,
   updates: {
@@ -3680,9 +3749,9 @@ export function updateReportByAdmin(
     resolution?: string;
     actionTaken?: string;
   }
-): { success: boolean; report?: DbReportWithDetails; error?: string } {
-  const db = getDatabase();
-  const existing = getReportById(reportId);
+): Promise<{ success: boolean; report?: DbReportWithDetails; error?: string }> {
+  const db = await getDatabase();
+  const existing = await getReportById(reportId);
   if (!existing) {
     return { success: false, error: "Report not found." };
   }
@@ -3695,13 +3764,13 @@ export function updateReportByAdmin(
   const actionTaken = (updates.actionTaken !== undefined ? updates.actionTaken : existing.actionTaken) ?? null;
   const resolvedAt = ((status === "resolved" || status === "dismissed") && !existing.resolvedAt ? now : existing.resolvedAt) ?? null;
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE user_reports 
     SET status = ?, assignedAdminId = ?, adminNotes = ?, resolution = ?, actionTaken = ?, resolvedAt = ?, updatedAt = ?
     WHERE id = ?
   `).run(status, assignedAdminId, adminNotes, resolution, actionTaken, resolvedAt, now, reportId);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: adminId,
     action: status === "resolved" ? "REPORT_RESOLVED" : "REPORT_UPDATED",
@@ -3712,7 +3781,7 @@ export function updateReportByAdmin(
   });
 
   if ((status === "resolved" || status === "dismissed") && resolution) {
-    createNotification({
+    await createNotification({
       userId: existing.reporterId,
       title: "Report Status Update",
       message: `Your report (ID: ${reportId}) has been marked as ${status}. Resolution: ${resolution}`,
@@ -3721,13 +3790,13 @@ export function updateReportByAdmin(
     });
   }
 
-  return { success: true, report: getReportById(reportId)! };
+  return { success: true, report: (await getReportById(reportId)) || undefined };
 }
 
 // 6. Platform Categories Management
-export function getAllPlatformCategories(): DbPlatformCategoryWithCount[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getAllPlatformCategories(): Promise<DbPlatformCategoryWithCount[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT 
       c.*,
       (SELECT COUNT(*) FROM resources WHERE category = c.name AND status != 'deleted') as resourceCount
@@ -3737,7 +3806,7 @@ export function getAllPlatformCategories(): DbPlatformCategoryWithCount[] {
   return rows;
 }
 
-export function createPlatformCategory(
+export async function createPlatformCategory(
   adminId: string,
   data: {
     name: string;
@@ -3746,12 +3815,12 @@ export function createPlatformCategory(
     icon?: string;
     displayOrder?: number;
   }
-): { success: boolean; category?: DbPlatformCategoryWithCount; error?: string } {
-  const db = getDatabase();
+): Promise<{ success: boolean; category?: DbPlatformCategoryWithCount; error?: string }> {
+  const db = await getDatabase();
   const trimmedName = data.name.trim();
   const slug = data.slug ? data.slug.trim().toLowerCase() : trimmedName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
-  const existing = db.prepare("SELECT id FROM platform_categories WHERE name = ? OR slug = ?").get(trimmedName, slug);
+  const existing = await db.prepare("SELECT id FROM platform_categories WHERE name = ? OR slug = ?").get(trimmedName, slug);
   if (existing) {
     return { success: false, error: "A category with this name or slug already exists." };
   }
@@ -3761,12 +3830,12 @@ export function createPlatformCategory(
   const icon = data.icon || "Tag";
   const displayOrder = data.displayOrder ?? 99;
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO platform_categories (id, name, slug, description, icon, isActive, displayOrder, createdAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
   `).run(id, trimmedName, slug, data.description.trim(), icon, displayOrder, now, now);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: adminId,
     action: "CATEGORY_CREATED",
@@ -3776,14 +3845,14 @@ export function createPlatformCategory(
     timestamp: now,
   });
 
-  const created = db.prepare(`
+  const created = await db.prepare(`
     SELECT c.*, 0 as resourceCount FROM platform_categories c WHERE c.id = ?
   `).get(id) as unknown as DbPlatformCategoryWithCount;
 
   return { success: true, category: created };
 }
 
-export function updatePlatformCategory(
+export async function updatePlatformCategory(
   adminId: string,
   id: string,
   data: {
@@ -3793,9 +3862,9 @@ export function updatePlatformCategory(
     isActive?: number;
     displayOrder?: number;
   }
-): { success: boolean; category?: DbPlatformCategoryWithCount; error?: string } {
-  const db = getDatabase();
-  const existing = db.prepare("SELECT * FROM platform_categories WHERE id = ?").get(id) as DbPlatformCategory | undefined;
+): Promise<{ success: boolean; category?: DbPlatformCategoryWithCount; error?: string }> {
+  const db = await getDatabase();
+  const existing = await db.prepare("SELECT * FROM platform_categories WHERE id = ?").get(id) as DbPlatformCategory | undefined;
   if (!existing) {
     return { success: false, error: "Category not found." };
   }
@@ -3807,13 +3876,13 @@ export function updatePlatformCategory(
   const isActive = data.isActive !== undefined ? data.isActive : existing.isActive;
   const displayOrder = data.displayOrder !== undefined ? data.displayOrder : existing.displayOrder;
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE platform_categories 
     SET name = ?, description = ?, icon = ?, isActive = ?, displayOrder = ?, updatedAt = ?
     WHERE id = ?
   `).run(name, description, icon, isActive, displayOrder, now, id);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: adminId,
     action: "CATEGORY_UPDATED",
@@ -3823,7 +3892,7 @@ export function updatePlatformCategory(
     timestamp: now,
   });
 
-  const updated = db.prepare(`
+  const updated = await db.prepare(`
     SELECT c.*, (SELECT COUNT(*) FROM resources WHERE category = c.name AND status != 'deleted') as resourceCount
     FROM platform_categories c WHERE c.id = ?
   `).get(id) as unknown as DbPlatformCategoryWithCount;
@@ -3831,17 +3900,17 @@ export function updatePlatformCategory(
   return { success: true, category: updated };
 }
 
-export function deletePlatformCategory(
+export async function deletePlatformCategory(
   adminId: string,
   id: string
-): { success: boolean; error?: string } {
-  const db = getDatabase();
-  const existing = db.prepare("SELECT * FROM platform_categories WHERE id = ?").get(id) as DbPlatformCategory | undefined;
+): Promise<{ success: boolean; error?: string }> {
+  const db = await getDatabase();
+  const existing = await db.prepare("SELECT * FROM platform_categories WHERE id = ?").get(id) as DbPlatformCategory | undefined;
   if (!existing) {
     return { success: false, error: "Category not found." };
   }
 
-  const countRow = db.prepare(`
+  const countRow = await db.prepare(`
     SELECT COUNT(*) as count FROM resources WHERE category = ? AND status != 'deleted'
   `).get(existing.name) as { count: number };
 
@@ -3852,9 +3921,9 @@ export function deletePlatformCategory(
     };
   }
 
-  db.prepare("DELETE FROM platform_categories WHERE id = ?").run(id);
+  await db.prepare("DELETE FROM platform_categories WHERE id = ?").run(id);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: adminId,
     action: "CATEGORY_DELETED",
@@ -3868,36 +3937,36 @@ export function deletePlatformCategory(
 }
 
 // 7. Platform Settings Management
-export function getAllPlatformSettings(): DbPlatformSetting[] {
-  const db = getDatabase();
-  return db.prepare("SELECT * FROM platform_settings ORDER BY category, key").all() as unknown as DbPlatformSetting[];
+export async function getAllPlatformSettings(): Promise<DbPlatformSetting[]> {
+  const db = await getDatabase();
+  return await db.prepare("SELECT * FROM platform_settings ORDER BY category, key").all() as unknown as DbPlatformSetting[];
 }
 
-export function getPlatformSettingValue(key: string, defaultValue = ""): string {
-  const db = getDatabase();
-  const row = db.prepare("SELECT value FROM platform_settings WHERE key = ?").get(key) as { value: string } | undefined;
+export async function getPlatformSettingValue(key: string, defaultValue = ""): Promise<string> {
+  const db = await getDatabase();
+  const row = await db.prepare("SELECT value FROM platform_settings WHERE key = ?").get(key) as { value: string } | undefined;
   return row ? row.value : defaultValue;
 }
 
-export function updatePlatformSetting(
+export async function updatePlatformSetting(
   adminId: string,
   key: string,
   value: string
-): { success: boolean; setting?: DbPlatformSetting; error?: string } {
-  const db = getDatabase();
-  const existing = db.prepare("SELECT * FROM platform_settings WHERE key = ?").get(key) as DbPlatformSetting | undefined;
+): Promise<{ success: boolean; setting?: DbPlatformSetting; error?: string }> {
+  const db = await getDatabase();
+  const existing = await db.prepare("SELECT * FROM platform_settings WHERE key = ?").get(key) as DbPlatformSetting | undefined;
   if (!existing) {
     return { success: false, error: `Setting '${key}' does not exist.` };
   }
 
   const now = new Date().toISOString();
-  db.prepare(`
+  await db.prepare(`
     UPDATE platform_settings 
     SET value = ?, updatedBy = ?, updatedAt = ?
     WHERE key = ?
   `).run(value, adminId, now, key);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: adminId,
     action: "SETTINGS_UPDATED",
@@ -3907,19 +3976,19 @@ export function updatePlatformSetting(
     timestamp: now,
   });
 
-  const updated = db.prepare("SELECT * FROM platform_settings WHERE key = ?").get(key) as unknown as DbPlatformSetting;
+  const updated = await db.prepare("SELECT * FROM platform_settings WHERE key = ?").get(key) as unknown as DbPlatformSetting;
   return { success: true, setting: updated };
 }
 
 // 8. Admin Audit Logs Querying
-export function getAllAuditLogsForAdmin(filters?: {
+export async function getAllAuditLogsForAdmin(filters?: {
   actorId?: string;
   entityType?: string;
   action?: string;
   limit?: number;
   offset?: number;
-}): { logs: (DbAuditLog & { actorName?: string; actorEmail?: string; actorRole?: string })[]; total: number } {
-  const db = getDatabase();
+}): Promise<{ logs: (DbAuditLog & { actorName?: string; actorEmail?: string; actorRole?: string })[]; total: number }> {
+  const db = await getDatabase();
   let baseQuery = `
     FROM audit_logs a
     LEFT JOIN users u ON a.actorId = u.id
@@ -3942,7 +4011,7 @@ export function getAllAuditLogsForAdmin(filters?: {
     params.push(filters.action);
   }
 
-  const total = (db.prepare(`SELECT COUNT(*) as c ${baseQuery}`).get(...params) as { c: number }).c;
+  const total = (await db.prepare(`SELECT COUNT(*) as c ${baseQuery}`).get(...params) as { c: number }).c;
 
   const limit = filters?.limit || 50;
   const offset = filters?.offset || 0;
@@ -3958,7 +4027,7 @@ export function getAllAuditLogsForAdmin(filters?: {
     LIMIT ? OFFSET ?
   `;
 
-  const logs = db.prepare(query).all(...params, limit, offset) as unknown as (DbAuditLog & { actorName?: string; actorEmail?: string; actorRole?: string })[];
+  const logs = await db.prepare(query).all(...params, limit, offset) as unknown as (DbAuditLog & { actorName?: string; actorEmail?: string; actorRole?: string })[];
 
   return { logs, total };
 }
@@ -3967,7 +4036,7 @@ export function getAllAuditLogsForAdmin(filters?: {
 // PHASE 7: PAYMENTS & REFUNDS DAO METHODS
 // ==========================================
 
-export function createPaymentOrder(params: {
+export async function createPaymentOrder(params: {
   userId: string;
   bookingId: string;
   resourceId: string;
@@ -3975,18 +4044,18 @@ export function createPaymentOrder(params: {
   amount: number;
   paymentType?: PaymentType;
   razorpayOrderId?: string;
-}): { success: boolean; payment?: DbPayment; error?: string } {
-  const db = getDatabase();
+}): Promise<{ success: boolean; payment?: DbPayment; error?: string }> {
+  const db = await getDatabase();
   const now = new Date().toISOString();
 
   // Validate booking exists
-  const booking = db.prepare("SELECT * FROM bookings WHERE id = ?").get(params.bookingId) as DbBooking | undefined;
+  const booking = await db.prepare("SELECT * FROM bookings WHERE id = ?").get(params.bookingId) as DbBooking | undefined;
   if (!booking) {
     return { success: false, error: "Booking not found." };
   }
 
   // Check if booking already has a captured deposit payment
-  const existingCaptured = db.prepare(`
+  const existingCaptured = await db.prepare(`
     SELECT * FROM payments 
     WHERE bookingId = ? AND status = 'captured'
   `).get(params.bookingId) as DbPayment | undefined;
@@ -4001,7 +4070,7 @@ export function createPaymentOrder(params: {
   const razorpayOrderId = params.razorpayOrderId || null;
 
   try {
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO payments (
         id, userId, bookingId, resourceId, ownerId, amount, currency,
         paymentType, status, razorpayOrderId, razorpayPaymentId, razorpaySignature,
@@ -4021,7 +4090,7 @@ export function createPaymentOrder(params: {
       now
     );
 
-    createAuditLog({
+    await createAuditLog({
       id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       actorId: params.userId,
       action: "PAYMENT_ORDER_CREATED",
@@ -4035,16 +4104,16 @@ export function createPaymentOrder(params: {
       timestamp: now,
     });
 
-    const payment = db.prepare("SELECT * FROM payments WHERE id = ?").get(id) as unknown as DbPayment;
+    const payment = await db.prepare("SELECT * FROM payments WHERE id = ?").get(id) as unknown as DbPayment;
     return { success: true, payment };
   } catch (err: any) {
     return { success: false, error: err.message || "Failed to create payment record." };
   }
 }
 
-export function getPaymentById(id: string): DbPaymentWithDetails | null {
-  const db = getDatabase();
-  const row = db.prepare(`
+export async function getPaymentById(id: string): Promise<DbPaymentWithDetails | null> {
+  const db = await getDatabase();
+  const row = await db.prepare(`
     SELECT 
       p.*,
       r.title as resourceTitle,
@@ -4063,9 +4132,9 @@ export function getPaymentById(id: string): DbPaymentWithDetails | null {
   return row || null;
 }
 
-export function getPaymentByOrderId(orderId: string): DbPaymentWithDetails | null {
-  const db = getDatabase();
-  const row = db.prepare(`
+export async function getPaymentByOrderId(orderId: string): Promise<DbPaymentWithDetails | null> {
+  const db = await getDatabase();
+  const row = await db.prepare(`
     SELECT 
       p.*,
       r.title as resourceTitle,
@@ -4084,9 +4153,9 @@ export function getPaymentByOrderId(orderId: string): DbPaymentWithDetails | nul
   return row || null;
 }
 
-export function getPaymentByPaymentId(paymentId: string): DbPaymentWithDetails | null {
-  const db = getDatabase();
-  const row = db.prepare(`
+export async function getPaymentByPaymentId(paymentId: string): Promise<DbPaymentWithDetails | null> {
+  const db = await getDatabase();
+  const row = await db.prepare(`
     SELECT 
       p.*,
       r.title as resourceTitle,
@@ -4105,9 +4174,9 @@ export function getPaymentByPaymentId(paymentId: string): DbPaymentWithDetails |
   return row || null;
 }
 
-export function getPaymentsByBookingId(bookingId: string): DbPaymentWithDetails[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getPaymentsByBookingId(bookingId: string): Promise<DbPaymentWithDetails[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT 
       p.*,
       r.title as resourceTitle,
@@ -4127,19 +4196,19 @@ export function getPaymentsByBookingId(bookingId: string): DbPaymentWithDetails[
   return rows || [];
 }
 
-export function capturePayment(params: {
+export async function capturePayment(params: {
   paymentId?: string;
   razorpayOrderId?: string;
   razorpayPaymentId: string;
   razorpaySignature?: string;
-}): { success: boolean; payment?: DbPaymentWithDetails; error?: string } {
-  const db = getDatabase();
+}): Promise<{ success: boolean; payment?: DbPaymentWithDetails; error?: string }> {
+  const db = await getDatabase();
   let payment: DbPaymentWithDetails | null = null;
 
   if (params.paymentId) {
-    payment = getPaymentById(params.paymentId);
+    payment = await getPaymentById(params.paymentId);
   } else if (params.razorpayOrderId) {
-    payment = getPaymentByOrderId(params.razorpayOrderId);
+    payment = await getPaymentByOrderId(params.razorpayOrderId);
   }
 
   if (!payment) {
@@ -4153,7 +4222,7 @@ export function capturePayment(params: {
 
   const now = new Date().toISOString();
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE payments 
     SET status = 'captured',
         razorpayPaymentId = ?,
@@ -4164,7 +4233,7 @@ export function capturePayment(params: {
   `).run(params.razorpayPaymentId, params.razorpaySignature || null, now, now, payment.id);
 
   // Update booking deposit status
-  db.prepare(`
+  await db.prepare(`
     UPDATE bookings 
     SET depositStatus = 'paid',
         depositPaidAt = ?,
@@ -4173,7 +4242,7 @@ export function capturePayment(params: {
   `).run(now, now, payment.bookingId);
 
   // Audit log
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: payment.userId,
     action: "PAYMENT_CAPTURED",
@@ -4190,7 +4259,7 @@ export function capturePayment(params: {
 
   // Notifications
   const amountStr = `₹${(payment.amount / 100).toFixed(2)}`;
-  createNotification({
+  await createNotification({
     userId: payment.ownerId,
     title: "Security Deposit Paid",
     message: `Security deposit of ${amountStr} has been successfully paid for ${payment.resourceTitle || "your equipment"} (Booking: ${payment.bookingId.slice(0, 8)}).`,
@@ -4198,7 +4267,7 @@ export function capturePayment(params: {
     relatedEntityId: payment.bookingId,
   });
 
-  createNotification({
+  await createNotification({
     userId: payment.userId,
     title: "Deposit Payment Successful",
     message: `Your security deposit payment of ${amountStr} for ${payment.resourceTitle || "equipment"} was confirmed.`,
@@ -4206,22 +4275,22 @@ export function capturePayment(params: {
     relatedEntityId: payment.bookingId,
   });
 
-  const updatedPayment = getPaymentById(payment.id);
+  const updatedPayment = await getPaymentById(payment.id);
   return { success: true, payment: updatedPayment! };
 }
 
-export function markPaymentFailed(params: {
+export async function markPaymentFailed(params: {
   paymentId?: string;
   razorpayOrderId?: string;
   failureReason: string;
-}): { success: boolean; error?: string } {
-  const db = getDatabase();
+}): Promise<{ success: boolean; error?: string }> {
+  const db = await getDatabase();
   let payment: DbPaymentWithDetails | null = null;
 
   if (params.paymentId) {
-    payment = getPaymentById(params.paymentId);
+    payment = await getPaymentById(params.paymentId);
   } else if (params.razorpayOrderId) {
-    payment = getPaymentByOrderId(params.razorpayOrderId);
+    payment = await getPaymentByOrderId(params.razorpayOrderId);
   }
 
   if (!payment) {
@@ -4229,7 +4298,7 @@ export function markPaymentFailed(params: {
   }
 
   const now = new Date().toISOString();
-  db.prepare(`
+  await db.prepare(`
     UPDATE payments 
     SET status = 'failed',
         failureReason = ?,
@@ -4237,7 +4306,7 @@ export function markPaymentFailed(params: {
     WHERE id = ?
   `).run(params.failureReason, now, payment.id);
 
-  createAuditLog({
+  await createAuditLog({
     id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     actorId: payment.userId,
     action: "PAYMENT_FAILED",
@@ -4253,9 +4322,9 @@ export function markPaymentFailed(params: {
   return { success: true };
 }
 
-export function getPaymentsForBorrower(userId: string): DbPaymentWithDetails[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getPaymentsForBorrower(userId: string): Promise<DbPaymentWithDetails[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT 
       p.*,
       r.title as resourceTitle,
@@ -4275,9 +4344,9 @@ export function getPaymentsForBorrower(userId: string): DbPaymentWithDetails[] {
   return rows || [];
 }
 
-export function getPaymentsForOwner(ownerId: string): DbPaymentWithDetails[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getPaymentsForOwner(ownerId: string): Promise<DbPaymentWithDetails[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT 
       p.*,
       r.title as resourceTitle,
@@ -4297,13 +4366,13 @@ export function getPaymentsForOwner(ownerId: string): DbPaymentWithDetails[] {
   return rows || [];
 }
 
-export function getAllPaymentsForAdmin(filters?: {
+export async function getAllPaymentsForAdmin(filters?: {
   status?: string;
   search?: string;
   limit?: number;
   offset?: number;
-}): { payments: DbPaymentWithDetails[]; total: number } {
-  const db = getDatabase();
+}): Promise<{ payments: DbPaymentWithDetails[]; total: number }> {
+  const db = await getDatabase();
   let baseQuery = `
     FROM payments p
     LEFT JOIN resources r ON p.resourceId = r.id
@@ -4324,7 +4393,7 @@ export function getAllPaymentsForAdmin(filters?: {
     params.push(s, s, s, s, s, s);
   }
 
-  const total = (db.prepare(`SELECT COUNT(*) as c ${baseQuery}`).get(...params) as { c: number }).c;
+  const total = (await db.prepare(`SELECT COUNT(*) as c ${baseQuery}`).get(...params) as { c: number }).c;
 
   const limit = filters?.limit || 50;
   const offset = filters?.offset || 0;
@@ -4343,34 +4412,34 @@ export function getAllPaymentsForAdmin(filters?: {
     LIMIT ? OFFSET ?
   `;
 
-  const payments = db.prepare(query).all(...params, limit, offset) as unknown as DbPaymentWithDetails[];
+  const payments = await db.prepare(query).all(...params, limit, offset) as unknown as DbPaymentWithDetails[];
 
   return { payments: payments || [], total };
 }
 
-export function getAdminPaymentMetrics(): AdminPaymentMetrics {
-  const db = getDatabase();
+export async function getAdminPaymentMetrics(): Promise<AdminPaymentMetrics> {
+  const db = await getDatabase();
 
-  const volumeRow = db.prepare(`
+  const volumeRow = await db.prepare(`
     SELECT 
       COALESCE(SUM(amount), 0) as totalVolumePaise
     FROM payments
     WHERE status IN ('captured', 'partially_refunded', 'refunded')
   `).get() as { totalVolumePaise: number };
 
-  const allTxRow = db.prepare(`
+  const allTxRow = await db.prepare(`
     SELECT COUNT(*) as c FROM payments
   `).get() as { c: number };
 
-  const successRow = db.prepare(`
+  const successRow = await db.prepare(`
     SELECT COUNT(*) as c FROM payments WHERE status IN ('captured', 'partially_refunded', 'refunded')
   `).get() as { c: number };
 
-  const failedRow = db.prepare(`
+  const failedRow = await db.prepare(`
     SELECT COUNT(*) as c FROM payments WHERE status = 'failed'
   `).get() as { c: number };
 
-  const refundSumRow = db.prepare(`
+  const refundSumRow = await db.prepare(`
     SELECT 
       COALESCE(SUM(amount), 0) as totalRefundedPaise,
       COUNT(*) as totalRefundsCount
@@ -4378,15 +4447,15 @@ export function getAdminPaymentMetrics(): AdminPaymentMetrics {
     WHERE status = 'processed'
   `).get() as { totalRefundedPaise: number; totalRefundsCount: number };
 
-  const pendingRefundsRow = db.prepare(`
+  const pendingRefundsRow = await db.prepare(`
     SELECT COUNT(*) as c FROM refunds WHERE status = 'pending'
   `).get() as { c: number };
 
-  const statusRows = db.prepare(`
+  const statusRows = await db.prepare(`
     SELECT status, COUNT(*) as count FROM payments GROUP BY status
   `).all() as { status: string; count: number }[];
 
-  const recent = getAllPaymentsForAdmin({ limit: 10 }).payments;
+  const recent = (await getAllPaymentsForAdmin({ limit: 10 })).payments;
 
   return {
     totalVolumePaise: volumeRow?.totalVolumePaise || 0,
@@ -4401,16 +4470,16 @@ export function getAdminPaymentMetrics(): AdminPaymentMetrics {
   };
 }
 
-export function createRefund(params: {
+export async function createRefund(params: {
   paymentId: string;
   amount: number;
   reason: string;
   adminId: string;
   notes?: string;
   razorpayRefundId?: string;
-}): { success: boolean; refund?: DbRefund; error?: string } {
-  const db = getDatabase();
-  const payment = getPaymentById(params.paymentId);
+}): Promise<{ success: boolean; refund?: DbRefund; error?: string }> {
+  const db = await getDatabase();
+  const payment = await getPaymentById(params.paymentId);
 
   if (!payment) {
     return { success: false, error: "Payment not found." };
@@ -4425,7 +4494,7 @@ export function createRefund(params: {
   }
 
   // Calculate sum of already processed refunds for this payment
-  const refundSumRow = db.prepare(`
+  const refundSumRow = await db.prepare(`
     SELECT COALESCE(SUM(amount), 0) as totalRefunded
     FROM refunds
     WHERE paymentId = ? AND status = 'processed'
@@ -4446,7 +4515,7 @@ export function createRefund(params: {
   const rzpRefundId = params.razorpayRefundId || `rfnd_test_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
 
   try {
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO refunds (
         id, paymentId, bookingId, userId, amount, reason, status,
         razorpayRefundId, failureReason, createdAt, updatedAt, processedAt
@@ -4469,7 +4538,7 @@ export function createRefund(params: {
 
     // Update payment status
     const newPaymentStatus: PaymentStatus = isFullRefund ? "refunded" : "partially_refunded";
-    db.prepare(`
+    await db.prepare(`
       UPDATE payments 
       SET status = ?, updatedAt = ?
       WHERE id = ?
@@ -4477,14 +4546,14 @@ export function createRefund(params: {
 
     // Update booking depositStatus
     const newDepositStatus: DepositStatus = isFullRefund ? "refunded" : "partially_refunded";
-    db.prepare(`
+    await db.prepare(`
       UPDATE bookings 
       SET depositStatus = ?, updatedAt = ?
       WHERE id = ?
     `).run(newDepositStatus, now, payment.bookingId);
 
     // Audit log
-    createAuditLog({
+    await createAuditLog({
       id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       actorId: params.adminId,
       action: "REFUND_PROCESSED",
@@ -4504,7 +4573,7 @@ export function createRefund(params: {
 
     // Notify Borrower
     const refundFormatted = `₹${(params.amount / 100).toFixed(2)}`;
-    createNotification({
+    await createNotification({
       userId: payment.userId,
       title: "Security Deposit Refund Processed",
       message: `A security deposit refund of ${refundFormatted} has been processed for your booking (${payment.bookingId.slice(0, 8)}). Reason: ${params.reason}.`,
@@ -4513,7 +4582,7 @@ export function createRefund(params: {
     });
 
     // Notify Owner
-    createNotification({
+    await createNotification({
       userId: payment.ownerId,
       title: "Security Deposit Refund Issued",
       message: `A security deposit refund of ${refundFormatted} was issued to borrower for booking (${payment.bookingId.slice(0, 8)}).`,
@@ -4521,24 +4590,24 @@ export function createRefund(params: {
       relatedEntityId: payment.bookingId,
     });
 
-    const refund = db.prepare("SELECT * FROM refunds WHERE id = ?").get(refundId) as unknown as DbRefund;
+    const refund = await db.prepare("SELECT * FROM refunds WHERE id = ?").get(refundId) as unknown as DbRefund;
     return { success: true, refund };
   } catch (err: any) {
     return { success: false, error: err.message || "Failed to process refund." };
   }
 }
 
-export function getRefundsByPaymentId(paymentId: string): DbRefund[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getRefundsByPaymentId(paymentId: string): Promise<DbRefund[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT * FROM refunds WHERE paymentId = ? ORDER BY createdAt DESC
   `).all(paymentId) as unknown as DbRefund[];
   return rows || [];
 }
 
-export function getAllRefundsForAdmin(): DbRefundWithDetails[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getAllRefundsForAdmin(): Promise<DbRefundWithDetails[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT 
       ref.*,
       r.title as resourceTitle,
@@ -4554,13 +4623,13 @@ export function getAllRefundsForAdmin(): DbRefundWithDetails[] {
   return rows || [];
 }
 
-export function recordWebhookEvent(params: {
+export async function recordWebhookEvent(params: {
   eventId: string;
   eventType: string;
   payload: string;
-}): { success: boolean; duplicate: boolean; id: string } {
-  const db = getDatabase();
-  const existing = db.prepare(`
+}): Promise<{ success: boolean; duplicate: boolean; id: string }> {
+  const db = await getDatabase();
+  const existing = await db.prepare(`
     SELECT * FROM payment_webhook_events WHERE eventId = ?
   `).get(params.eventId) as DbPaymentWebhookEvent | undefined;
 
@@ -4572,7 +4641,7 @@ export function recordWebhookEvent(params: {
   const now = new Date().toISOString();
 
   try {
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO payment_webhook_events (
         id, eventId, eventType, payload, processingStatus, receivedAt, processedAt
       ) VALUES (?, ?, ?, ?, 'received', ?, NULL)
@@ -4581,7 +4650,7 @@ export function recordWebhookEvent(params: {
     return { success: true, duplicate: false, id };
   } catch (err: any) {
     // If concurrent race condition triggered UNIQUE constraint
-    const retry = db.prepare(`
+    const retry = await db.prepare(`
       SELECT * FROM payment_webhook_events WHERE eventId = ?
     `).get(params.eventId) as DbPaymentWebhookEvent | undefined;
     if (retry) {
@@ -4591,22 +4660,22 @@ export function recordWebhookEvent(params: {
   }
 }
 
-export function updateWebhookEventStatus(
+export async function updateWebhookEventStatus(
   eventId: string,
   status: "received" | "processed" | "ignored" | "failed"
-): void {
-  const db = getDatabase();
+): Promise<void> {
+  const db = await getDatabase();
   const now = new Date().toISOString();
-  db.prepare(`
+  await db.prepare(`
     UPDATE payment_webhook_events
     SET processingStatus = ?, processedAt = ?
     WHERE eventId = ?
   `).run(status, now, eventId);
 }
 
-export function getAllWebhookEventsForAdmin(limit = 30): DbPaymentWebhookEvent[] {
-  const db = getDatabase();
-  const rows = db.prepare(`
+export async function getAllWebhookEventsForAdmin(limit = 30): Promise<DbPaymentWebhookEvent[]> {
+  const db = await getDatabase();
+  const rows = await db.prepare(`
     SELECT * FROM payment_webhook_events ORDER BY receivedAt DESC LIMIT ?
   `).all(limit) as unknown as DbPaymentWebhookEvent[];
   return rows || [];

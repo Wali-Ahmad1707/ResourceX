@@ -7,7 +7,7 @@ export async function POST(request: Request) {
     const user = await getCurrentUser();
     
     if (user) {
-      createAuditLog({
+      await createAuditLog({
         id: `aud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
         actorId: user.id,
         action: "USER_LOGGED_OUT",

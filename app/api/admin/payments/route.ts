@@ -18,14 +18,14 @@ export async function GET(req: NextRequest) {
     const limit = searchParams.get("limit") ? parseInt(searchParams.get("limit")!, 10) : 50;
     const offset = searchParams.get("offset") ? parseInt(searchParams.get("offset")!, 10) : 0;
 
-    const { payments, total } = getAllPaymentsForAdmin({
+    const { payments, total } = await getAllPaymentsForAdmin({
       status,
       search,
       limit,
       offset,
     });
 
-    const metrics = getAdminPaymentMetrics();
+    const metrics = await getAdminPaymentMetrics();
 
     return NextResponse.json({
       success: true,

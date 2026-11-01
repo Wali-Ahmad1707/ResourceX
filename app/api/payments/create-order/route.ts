@@ -37,7 +37,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const booking = getBookingById(bookingId);
+    const booking = await getBookingById(bookingId);
     if (!booking) {
       return NextResponse.json(
         { error: "Booking not found." },
@@ -66,7 +66,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const resource = getDbResourceById(booking.resourceId);
+    const resource = await getDbResourceById(booking.resourceId);
     let amountPaise = parseDepositToPaise(resource?.deposit);
     // If deposit parsed is 0, provide default minimum 5000 paise (₹50)
     if (amountPaise <= 0) {
@@ -98,7 +98,7 @@ export async function POST(req: NextRequest) {
       orderId = `order_test_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     }
 
-    const orderRes = createPaymentOrder({
+    const orderRes = await createPaymentOrder({
       userId: user.id,
       bookingId: booking.id,
       resourceId: booking.resourceId,

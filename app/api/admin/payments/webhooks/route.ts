@@ -12,7 +12,7 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const events = getAllWebhookEventsForAdmin(50);
+    const events = await getAllWebhookEventsForAdmin(50);
 
     return NextResponse.json({
       success: true,
