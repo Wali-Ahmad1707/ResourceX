@@ -1,0 +1,46 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# debug and server logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+*.log
+server*.log
+
+# env files
+.env*
+!.env.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# SQLite Database & Backups
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db.bak
+*.db
+*.db-wal
+*.db-shm
+
+# Persistent user uploads
+/public/uploads/*
+!/public/uploads/.gitkeep
+
+# Backup files
+*.bak
